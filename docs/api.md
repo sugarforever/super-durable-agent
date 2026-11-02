@@ -27,8 +27,8 @@ Policy contains version, acceptMode, allowedActors, botActors, rules, and option
 - `pump()` durably claims pending work and creates finite background Tasks; it returns before model completion.
 - `deliverPending()` invokes the same pump and does not promise input placement.
 - `waitForIdle()` explicitly joins background input/redrive/cancellation work and ordinary generation, including newly promoted work.
-- `ensureWorker(ticketId)` atomically creates/configures/binds one ownerless Worker, or returns the existing numeric ConversationId.
-- `submitDelivery(id, exactPrompt?)` is a trusted-host replay helper; a changed prompt or digest conflicts.
+- `ensureWorker(ticketId)` atomically creates/configures/binds one ownerless Worker under a current reservation, or returns the existing numeric ConversationId. Pump obtains the reservation first.
+- `submitDelivery(id, exactPrompt?)` is a trusted-host replay helper for an already-admitted submission; a changed prompt or digest conflicts. Use pump for first admission so reservations and cancellation fences apply.
 - `noteWorker(routerConversationId, ticketId, text, id, mode?)` creates factual context without authority. Normal notes use followUp; trusted host corrections may select steer.
 - `decideBatch(routerConversationId, decisions, callId?)` returns independent success/error outcomes for each item.
 

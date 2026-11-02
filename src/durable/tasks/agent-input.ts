@@ -191,7 +191,7 @@ export function createAgentInputTask(coordinator: AgentCoordinator) {
 }
 export function createCancelTask(coordinator: AgentCoordinator) {
   return defineTask<
-    { intentId: string; conversationId: ConversationId },
+    { intentId: string; conversationId?: ConversationId },
     { phase: "cancel" },
     null
   >({
@@ -200,10 +200,7 @@ export function createCancelTask(coordinator: AgentCoordinator) {
     initial: () => ({ phase: "cancel" }),
     phases: {
       cancel: async (task, runtime, context) => {
-        const claim = await coordinator.engine.store.read<{
-          taskId?: TaskId;
-          status: string;
-        }>("cancel", task.input.intentId);
+        const claim = await coordinator.engine.store.read<import("../../domain/model.js").CancelIntent>("cancel", task.input.intentId);
         if (
           !claim ||
           claim.taskId !== runtime.taskId ||
@@ -218,27 +215,15 @@ export function createCancelTask(coordinator: AgentCoordinator) {
           );
           return;
         }
-        const conversation = await runtime.conversation(
-          task.input.conversationId,
-          context,
-        );
-        await conversation?.abort(context, { background: true });
+        const receipt = await coordinator.cancellation.cancel(claim, task.input.conversationId, context, runtime);
         await runtime.commit(async (tx) => {
-          const intent = await coordinator.engine.store.get<
-            Record<string, JsonValue>
-          >(tx, "cancel", task.input.intentId);
-          if (intent?.taskId === runtime.taskId)
-            await coordinator.engine.store.put(
-              tx,
-              "cancel",
-              task.input.intentId,
-              { ...intent, status: "completed" },
-            );
+          await coordinator.cancellation.receipt(tx, task.input.intentId, receipt, runtime.taskId);
           return {
             status: "terminal",
             outcome: { status: "completed", result: null },
           };
         }, context);
+        coordinator.kick();
       },
     },
     abort: async (_task, runtime, context) => {
@@ -305,7 +290,7 @@ export function createRedriveTask(coordinator: AgentCoordinator) {
         context,
       );
       if ((await submission?.status(context))?.status === "queued") {
-        if (task.input.exhausted) await submission!.abort(context);
+        if (task.input.exhausted || !(await coordinator.isCurrent(run))) await submission!.abort(context);
         else {
           const conversation = await coordinator.engine.harness.conversation(
             task.input.conversationId,

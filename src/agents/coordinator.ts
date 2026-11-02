@@ -1,3 +1,6 @@
+import { Cancellation, type CancellationHandler } from "../services/cancellation.js";
+import type { Reservation } from "../runtime/scheduler.js";
+import { reconcile } from "../runtime/reconcile.js";
 import { Type } from "@earendil-works/pi-ai";
 import {
   configure,
@@ -28,6 +31,8 @@ import {
   type Trigger,
   type DecisionOutcome,
   type Policy,
+  type ReportStatus,
+  type WorkerQuestion,
 } from "../domain/model.js";
 import {
   routerAuthority,
@@ -62,13 +67,16 @@ interface Note {
   artifact?: string;
   kind?: "policy";
   policyVersion?: number;
+  human?: boolean;
 }
 export interface WorkerReport {
   reportId: string;
   assignmentId: string;
   epoch: number;
   inputIds: string[];
-  status: "waiting" | "ready" | "attention";
+  status: ReportStatus;
+  questions?: WorkerQuestion[];
+  waitingFor?: "human" | "endpoint" | "input";
   content: JsonValue;
 }
 export interface RecallPage {
@@ -104,10 +112,16 @@ const reportSchema = Type.Object({
   epoch: Type.Integer({ minimum: 1 }),
   inputIds: Type.Array(str(), { maxItems: 128, uniqueItems: true }),
   status: Type.Union([
+    Type.Literal("progress"),
+    Type.Literal("blocked"),
+    Type.Literal("failed"),
+    Type.Literal("dropped"),
     Type.Literal("waiting"),
     Type.Literal("ready"),
     Type.Literal("attention"),
   ]),
+  questions: Type.Optional(Type.Array(Type.Object({ id: str(), text: str(), options: Type.Optional(Type.Array(str())) }), { maxItems: 32 })),
+  waitingFor: Type.Optional(Type.Union([Type.Literal("human"), Type.Literal("endpoint"), Type.Literal("input")])),
   content: Type.Unknown(),
 });
 export class AgentCoordinator {
@@ -118,6 +132,7 @@ export class AgentCoordinator {
   readonly workerExtension: Extension;
   routerConversationId!: ConversationId;
   readonly artifactRoot: string;
+  readonly cancellation: Cancellation;
   private stopped = false;
   private timer?: ReturnType<typeof setTimeout>;
   private pumping?: Promise<void>;
@@ -125,8 +140,10 @@ export class AgentCoordinator {
     readonly engine: Engine,
     readonly artifacts: Artifacts,
     readonly model?: ModelRef,
+    cancellationHandler?: CancellationHandler,
   ) {
     this.artifactRoot = artifacts.root;
+    this.cancellation = new Cancellation(engine, cancellationHandler);
     const tool = (
       name: string,
       description: string,
@@ -275,11 +292,16 @@ export class AgentCoordinator {
     if (!this.model) throw new Error("Agent model is not configured");
     const ticket = await this.engine.store.read<Ticket>("ticket", ticketId);
     if (!ticket) throw new Error("Unknown Ticket");
-    const goal = await this.artifacts.spill(ticket.goal);
-    const existingContext = await this.engine.store.read<WorkerContextRecord>(
+    if (ticket.lifecycle === "stopped") throw new Error("Ticket stopped or missing");
+    const storedContext = await this.engine.store.read<WorkerContextRecord>(
       "workerContext",
       ticketId,
     );
+    const contextMandate = storedContext?.mandateId ?? (storedContext && "mandate" in storedContext.summary ? storedContext.summary.mandate.id : undefined);
+    const existingContext = contextMandate === ticket.mandateId ? storedContext : undefined;
+    if (existingContext && ticket.workerConversationId !== undefined) return ticket.workerConversationId;
+    if (!(await this.engine.transaction(tx => this.engine.scheduler.holds(tx, ticket.id, ticket.assignmentEpoch)))) throw new Error("Worker preparation requires a reservation");
+    const goal = await this.artifacts.spill(ticket.goal);
     const mandate = await this.engine.store.read<Mandate>(
       "mandate",
       ticket.mandateId,
@@ -298,6 +320,7 @@ export class AgentCoordinator {
     const reference = `worker_context:${ticketId}`;
     const contextRecord: WorkerContextRecord = existingContext ?? {
       ticketId,
+      mandateId: ticket.mandateId,
       text: authoritySpill!.text,
       ...(authoritySpill!.artifact
         ? { artifact: authoritySpill!.artifact }
@@ -315,6 +338,7 @@ export class AgentCoordinator {
       );
       if (!current || current.lifecycle === "stopped")
         throw new Error("Ticket stopped or missing");
+      if (current.assignmentEpoch !== ticket.assignmentEpoch || current.mandateId !== ticket.mandateId || !(await this.engine.scheduler.holds(tx, ticket.id, ticket.assignmentEpoch))) throw new Error("Assignment changed during Worker preparation");
       if (current.workerConversationId !== undefined && existingContext)
         return current.workerConversationId;
       const conversation =
@@ -364,8 +388,25 @@ export class AgentCoordinator {
   }
   private async performPump(): Promise<void> {
     const { store } = this.engine;
+    await reconcile(this.engine);
+    await this.engine.transaction(async tx => {
+      for (const intent of await store.listInTransaction<DeliveryIntent>(tx, "delivery")) {
+        if (intent.status !== "pending" || await store.get(tx, "deliveryRun", intent.id)) continue;
+        const ticket = await store.get<Ticket>(tx, "ticket", intent.ticketId);
+        const trigger = await store.get<Trigger>(tx, "trigger", intent.triggerId);
+        if (ticket?.lifecycle === "open" && ticket.assignmentEpoch === intent.epoch)
+          await this.engine.scheduler.enqueue(tx, ticket, trigger?.actor.kind === "human" && trigger.actor.trusted);
+      }
+      for (const note of await store.listInTransaction<Note>(tx, "workerNote")) {
+        if (note.status !== "pending" || await store.get(tx, "deliveryRun", note.id)) continue;
+        const ticket = await store.get<Ticket>(tx, "ticket", note.ticketId);
+        if (ticket?.lifecycle === "open") await this.engine.scheduler.enqueue(tx, ticket, note.human === true);
+      }
+      await this.engine.scheduler.dispatch(tx);
+    });
     for (const ticket of await store.list<Ticket>("ticket"))
-      if (ticket.lifecycle === "open") await this.ensureWorker(ticket.id);
+      if (ticket.lifecycle === "open" && await this.engine.transaction(tx => this.engine.scheduler.holds(tx, ticket.id, ticket.assignmentEpoch)))
+        await this.ensureWorker(ticket.id);
     // Prepare immutable prompt bodies outside the commit; claims are serialized below.
     const drafts: AgentRun[] = [];
     for (const intent of await store.list<DeliveryIntent>("delivery")) {
@@ -380,7 +421,8 @@ export class AgentCoordinator {
         !ticket?.workerConversationId ||
         ticket.lifecycle !== "open" ||
         ticket.assignmentEpoch !== intent.epoch ||
-        !trigger
+        !trigger ||
+        !(await this.engine.transaction(tx => this.engine.scheduler.holds(tx, ticket.id, ticket.assignmentEpoch)))
       )
         continue;
       const raw = canonicalJson({
@@ -427,7 +469,7 @@ export class AgentCoordinator {
       )
         continue;
       const ticket = await store.read<Ticket>("ticket", note.ticketId);
-      if (!ticket?.workerConversationId || ticket.lifecycle !== "open")
+      if (!ticket?.workerConversationId || ticket.lifecycle !== "open" || !(await this.engine.transaction(tx => this.engine.scheduler.holds(tx, ticket.id, ticket.assignmentEpoch))))
         continue;
       const policy =
         note.kind === "policy"
@@ -469,7 +511,8 @@ export class AgentCoordinator {
         if (
           !ticket ||
           ticket.lifecycle !== "open" ||
-          ticket.assignmentEpoch !== draft.epoch
+          ticket.assignmentEpoch !== draft.epoch ||
+          !(await this.engine.scheduler.holds(tx, ticket.id, ticket.assignmentEpoch))
         )
           continue;
         if (draft.intentId) {
@@ -495,6 +538,9 @@ export class AgentCoordinator {
           { ownership: { kind: "conversation" }, background: true },
         );
         await store.put(tx, "deliveryRun", draft.id, { ...draft, taskId });
+        const reservationId = this.engine.scheduler.key(ticket.id, ticket.assignmentEpoch);
+        const reservation = await store.get<Reservation>(tx, "reservation", reservationId);
+        if (reservation) await store.put(tx, "reservation", reservationId, { ...reservation, status: "active" });
         const note = await store.get<Note>(tx, "workerNote", draft.id);
         if (note)
           await store.put(tx, "workerNote", draft.id, {
@@ -525,20 +571,13 @@ export class AgentCoordinator {
         const task = claim.taskId ? tasks.get(claim.taskId) : undefined;
         if (task && task.state.status !== "terminal") continue;
         const ticket = await store.get<Ticket>(tx, "ticket", claim.ticketId);
-        if (!ticket?.workerConversationId) {
-          await store.put(tx, "cancel", claim.id, {
-            ...claim,
-            status: "completed",
-          });
-          continue;
-        }
         const attempts = claim.taskId ? (claim.attempts ?? 1) + 1 : 1;
         if (attempts > 3) {
           await store.put(tx, "cancel", claim.id, {
             ...claim,
             status: "attention",
           });
-          await store.put(tx, "ticket", ticket.id, {
+          if (ticket) await store.put(tx, "ticket", ticket.id, {
             ...ticket,
             attention: "Worker cancel failed after 3 attempts",
           });
@@ -546,10 +585,11 @@ export class AgentCoordinator {
         }
         const taskId = await tx.createTask(
           this.cancelTask,
-          { intentId: claim.id, conversationId: ticket.workerConversationId },
+          { intentId: claim.id, ...(ticket?.workerConversationId !== undefined ? { conversationId: ticket.workerConversationId } : {}) },
           { ownership: { kind: "conversation" }, background: true },
         );
-        await store.put(tx, "cancel", claim.id, { ...claim, taskId, attempts });
+        const identity = this.cancellation.request(claim);
+        await store.put(tx, "cancel", claim.id, { ...claim, cancelKey: identity.cancelKey, payloadDigest: identity.payloadDigest, taskId, attempts });
       }
       for (const claim of redrives) {
         if (claim.status !== "pending") continue;
@@ -644,6 +684,10 @@ export class AgentCoordinator {
       for (const { kind, runs } of records)
         for (const run of runs) {
           if (run.status !== "pending" && run.status !== "submitted") continue;
+          if (run.ticketId) {
+            const ticket = await store.get<Ticket>(tx, "ticket", run.ticketId);
+            if (!ticket || ticket.lifecycle !== "open" || ticket.assignmentEpoch !== run.epoch || !(await this.engine.scheduler.holds(tx, ticket.id, ticket.assignmentEpoch))) continue;
+          }
           const task = tasks.get(run.taskId);
           if (!task || task.state.status === "terminal") {
             const executions = (run.executionAttempts ?? 1) + 1;
@@ -786,30 +830,24 @@ export class AgentCoordinator {
     return (
       !!ticket &&
       ticket.lifecycle === "open" &&
-      ticket.assignmentEpoch === run.epoch
+      ticket.assignmentEpoch === run.epoch &&
+      await this.engine.transaction(tx => this.engine.scheduler.holds(tx, ticket.id, ticket.assignmentEpoch))
     );
   }
+  /** Read-only replay. Only invocation-bound native tasks may admit new work. */
   async submitDelivery(id: string, prompt?: string): Promise<number> {
-    const run = await this.engine.store.read<AgentRun>("deliveryRun", id);
-    if (!run) throw new Error("Unknown delivery");
-    if (prompt !== undefined && prompt !== run.prompt)
-      throw new Error("Immutable delivery payload conflict");
-    this.validatePrompt(run);
-    if (!(await this.isCurrent(run))) throw new Error("Stale delivery");
-    const conversation = await this.engine.harness.conversation(
-      run.conversationId,
-      this.engine.context,
-    );
-    const submission = await conversation!.submit(
-      {
-        type: "input",
-        requestId: run.requestId,
-        content: run.prompt,
-        whenBusy: run.mode,
-      },
-      this.engine.context,
-    );
-    return submission.id;
+    return this.engine.transaction(async tx => {
+      const run = await this.engine.store.get<AgentRun>(tx, "deliveryRun", id);
+      if (!run) throw new Error("Unknown delivery");
+      if (prompt !== undefined && prompt !== run.prompt)
+        throw new Error("Immutable delivery payload conflict");
+      this.validatePrompt(run);
+      const ticket = run.ticketId ? await this.engine.store.get<Ticket>(tx, "ticket", run.ticketId) : undefined;
+      if (!ticket || ticket.lifecycle !== "open" || ticket.assignmentEpoch !== run.epoch) throw new Error("Stale delivery");
+      const submission = await tx.submissionByRequest(run.conversationId, run.requestId);
+      if (!submission) throw new Error("Delivery has not been admitted; call agents.pump() and await native admission before replay");
+      return submission.id;
+    });
   }
   async settleInTransaction(
     tx: Tx,
@@ -870,7 +908,7 @@ export class AgentCoordinator {
       }
     }
     await store.put(tx, kind, id, next);
-    if (kind === "deliveryRun" && run.intentId && receipt.entry !== undefined)
+    if (valid && kind === "deliveryRun" && run.intentId && receipt.entry !== undefined)
       await this.engine.authorization.acknowledgeDeliveryInTransaction(
         tx,
         run.intentId,
@@ -1211,6 +1249,13 @@ export class AgentCoordinator {
     conversationId: ConversationId,
     report: WorkerReport,
   ): Promise<{ ok: true }> {
+    if (!report || !["progress","waiting","ready","blocked","failed","dropped","attention"].includes(report.status) ||
+      typeof report.reportId !== "string" || !report.reportId.trim() || typeof report.assignmentId !== "string" || !report.assignmentId.trim() ||
+      !Number.isSafeInteger(report.epoch) || report.epoch < 1 || !Array.isArray(report.inputIds) || report.inputIds.length > 128 ||
+      report.inputIds.some(x => typeof x !== "string" || !x.trim()) || new Set(report.inputIds).size !== report.inputIds.length ||
+      (report.waitingFor !== undefined && !["human","endpoint","input"].includes(report.waitingFor)) ||
+      (report.questions !== undefined && (!Array.isArray(report.questions) || report.questions.length > 32 || report.questions.some(q => !q || typeof q.id !== "string" || !q.id.trim() || typeof q.text !== "string" || !q.text.trim() || (q.options !== undefined && (!Array.isArray(q.options) || q.options.some(x => typeof x !== "string" || !x.trim())))))))
+      throw new Error("Invalid structured Worker Report");
     const b = await this.binding(conversationId);
     const content = await this.artifacts.spill(canonicalJson(report.content));
     const receiptId = scopedId(this.engine.instanceId, "report", [
@@ -1273,6 +1318,7 @@ export class AgentCoordinator {
         }
         const value = {
           ...report,
+          ...(report.questions?.length ? { status: "waiting" as const, waitingFor: "human" as const } : {}),
           content: content.artifact
             ? { excerpt: content.text, reference: receiptId }
             : report.content,
@@ -1290,8 +1336,8 @@ export class AgentCoordinator {
           revision: ticket.revision + 1,
         };
         delete next.attention;
-        if (report.status === "attention")
-          next.attention = "Worker requested attention";
+        if (["attention", "blocked", "failed", "dropped"].includes(report.status))
+          next.attention = `Worker reported ${report.status}`;
         await store.put(tx, "ticket", ticket.id, next);
         const assignment = await store.get<Assignment>(
           tx,
@@ -1305,6 +1351,7 @@ export class AgentCoordinator {
           });
       },
     );
+    this.kick();
     return { ok: true };
   }
   async recall(
@@ -1483,10 +1530,17 @@ export class AgentCoordinator {
           ...(await this.engine.store.list<AgentRun>("deliveryRun")),
           ...(await this.engine.store.list<AgentRun>("routerBatch")),
         ];
-        if (
-          !again.some((r) => r.status === "pending" || r.status === "submitted")
-        )
-          break;
+        const auxiliary = [
+          ...(await this.engine.store.list<CancelIntent>("cancel")),
+          ...(await this.engine.store.list<{ taskId?: TaskId<null> }>("redrive")),
+        ];
+        let auxiliaryLive = false;
+        for (const claim of auxiliary) {
+          if (!claim.taskId) continue;
+          const task = await this.engine.harness.getTask(claim.taskId, this.engine.context);
+          if (task && task.state.status !== "terminal") auxiliaryLive = true;
+        }
+        if (!auxiliaryLive && !again.some((r) => r.status === "pending" || r.status === "submitted")) break;
       } else
         await Promise.all(
           live.map((id) =>

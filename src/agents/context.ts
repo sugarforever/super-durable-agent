@@ -77,6 +77,7 @@ export interface WorkerAuthority {
 }
 export interface WorkerContextRecord {
   ticketId: string;
+  mandateId?: string;
   text: string;
   artifact?: string;
   summary: WorkerAuthority | { excerpt: string; reference: string };

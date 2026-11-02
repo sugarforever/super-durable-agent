@@ -1,5 +1,6 @@
 import type { Context, JsonValue } from '@earendil-works/chord';
 import { defineTask, type Conversation, type Harness, type Tx } from '@earendil-works/pi-durable';
+import { Scheduler, type Clock } from '../runtime/scheduler.js';
 import { DomainStore } from './store.js';
 import { PolicyController } from './policy.js';
 import type { Actor, CommandMeta, DecisionOutcome, Policy } from './model.js';
@@ -31,6 +32,7 @@ export function createIntakeTask(store: DomainStore) {
 }
 export class Engine {
   readonly authorization = new PolicyController(this);
+  readonly scheduler: Scheduler;
   /** Host preprocessing performs artifact IO before entering a transaction. */
   prepareEvent?: (event: NormalizedEvent) => Promise<PreparedEvent>;
 
@@ -41,6 +43,7 @@ export class Engine {
   unsubscribe(ticketId: string, sourceId: string, threadRef: string, meta: CommandMeta) { return this.authorization.unsubscribe(ticketId, sourceId, threadRef, meta); }
   handback(ticketId: string, triggerId: string, epoch: number, reason: string, meta: CommandMeta) { return this.authorization.handback(ticketId, triggerId, epoch, reason, meta); }
   stopTicket(ticketId: string, actor: Actor, meta: CommandMeta) { return this.authorization.stopTicket(ticketId, actor, meta); }
+  retryTicket(ticketId: string, actor: Actor, meta: CommandMeta) { return this.authorization.retryTicket(ticketId, actor, meta); }
   endTicket(ticketId: string, epoch: number, meta: CommandMeta) { return this.authorization.endTicket(ticketId, epoch, meta); }
 
   constructor(
@@ -51,7 +54,8 @@ export class Engine {
     readonly instanceId: string,
     readonly maxPending = 10_000,
     private readonly intakeTask = createIntakeTask(store),
-  ) {}
+    clock?: Clock,
+  ) { this.scheduler = new Scheduler(this, clock); }
 
   /** Commit callbacks perform domain edits and create intents only; external IO belongs to tasks. */
   transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> { return this.control.commit(fn, this.context); }

@@ -1,3 +1,6 @@
+import { reconcile } from "./reconcile.js";
+import type { Clock } from "./scheduler.js";
+import type { CancellationHandler } from "../services/cancellation.js";
 import { mkdir, open, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -39,6 +42,8 @@ export interface OpenOptions {
   instanceId?: string;
   maxPending?: number;
   maxIndexEntries?: number;
+  clock?: Clock;
+  cancellationHandler?: CancellationHandler;
   /** Additional recovery checks run while scheduling is paused. Throwing closes storage and releases the lock. */
   preflight?: (engine: Engine) => Promise<void>;
 }
@@ -78,6 +83,7 @@ export interface SuperAgentRuntime {
     meta: CommandMeta,
   ): Promise<void>;
   stopTicket(ticketId: string, actor: Actor, meta: CommandMeta): Promise<void>;
+  retryTicket(ticketId: string, actor: Actor, meta: CommandMeta): Promise<void>;
   endTicket(ticketId: string, epoch: number, meta: CommandMeta): Promise<void>;
   receive(event: NormalizedEvent): Promise<ReceiveResult>;
   receiveBatch(
@@ -172,6 +178,7 @@ export async function openSuperAgent(
       instanceId,
       maxPending,
       intakeTask,
+      options.clock,
     );
     const artifacts = new Artifacts(directory);
     engine.prepareEvent = async (event) => {
@@ -182,7 +189,7 @@ export async function openSuperAgent(
         ...(body.artifact ? { bodyArtifact: body.artifact } : {}),
       };
     };
-    const coordinator = new AgentCoordinator(engine, artifacts, options.model);
+    const coordinator = new AgentCoordinator(engine, artifacts, options.model, options.cancellationHandler);
     registry.install(coordinator.routerExtension);
     registry.install(coordinator.workerExtension);
     registry.install(
@@ -258,6 +265,7 @@ export async function openSuperAgent(
           enabled: true,
         });
     });
+    await reconcile(engine);
     // An explicit model activates execution. A model-free recovery keeps live
     // agent tasks durable and paused; domain receives/commands still commit.
     const recoveredAgentWork =
@@ -297,6 +305,10 @@ export async function openSuperAgent(
         engine.handback(ticketId, triggerId, epoch, reason, meta),
       stopTicket: async (ticketId, actor, meta) => {
         await engine.stopTicket(ticketId, actor, meta);
+        agents?.kick();
+      },
+      retryTicket: async (ticketId, actor, meta) => {
+        await engine.retryTicket(ticketId, actor, meta);
         agents?.kick();
       },
       endTicket: (ticketId, epoch, meta) =>
