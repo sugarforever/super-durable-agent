@@ -124,4 +124,57 @@ describe('authorization decisions on real pi SQLite', () => {
     expect((await r.list('mandate'))[0].capabilities).toEqual(['repo.read', 'channel.reply']);
   });
 
+  it('freezes one pending Eval per Thread and retains later requests for the next batch', async () => {
+    const r = await open(); await r.updatePolicy(policy('auto'), alice, { commandId: 'p' });
+    const first = await r.receive(event('first', { addressed: true })); const [active] = await r.listCandidates();
+    const second = await r.receive(event('second', { addressed: true }));
+    expect(await r.listCandidates()).toMatchObject([{ id: active.id, triggerIds: [first.triggerId] }]);
+    expect((await r.engine.store.read('state', 'intake')).count).toBe(2);
+    await r.decide(active.id, active.epoch, { kind: 'ignore', reason: 'first only' }, { commandId: 'first' });
+    const [next] = await r.listCandidates(); expect(next.triggerIds).toEqual([second.triggerId]);
+    await r.decide(next.id, next.epoch, { kind: 'ignore', reason: 'second only' }, { commandId: 'second' });
+    expect(await r.listCandidates()).toEqual([]);
+    expect((await r.engine.store.read('state', 'intake')).count).toBe(0);
+  });
+  it('acceptance reroutes queued own human input to its new owner without a second Ticket', async () => {
+    const r = await open(); await r.updatePolicy(policy('auto'), alice, { commandId: 'p' });
+    await r.receive(event('first', { addressed: true })); const [active] = await r.listCandidates();
+    const second = await r.receive(event('second', { addressed: true }));
+    await r.decide(active.id, active.epoch, { kind: 'accept', goal: 'One task', ruleIds: [] }, { commandId: 'accept' });
+    expect(await r.listCandidates()).toEqual([]);
+    const [ticket] = await r.list('ticket'); expect(await r.list('ticket')).toHaveLength(1);
+    expect((await r.list('delivery')).filter(d => d.triggerId === second.triggerId)).toMatchObject([{ ticketId: ticket.id, own: true }]);
+  });
+  it('policy updates replace stale epochs and retain active and queued requests once', async () => {
+    const r = await open(); await r.updatePolicy(policy('auto'), alice, { commandId: 'p1' });
+    const first = await r.receive(event('first')); const [old] = await r.listCandidates();
+    const second = await r.receive(event('second'));
+    await r.updatePolicy(policy('auto', 2), alice, { commandId: 'p2' });
+    await expect(r.decide(old.id, old.epoch, { kind: 'ignore', reason: 'late' }, { commandId: 'late' })).rejects.toThrow(/stale|policy/i);
+    const [fresh] = await r.listCandidates(); expect(fresh).toMatchObject({ policyVersion: 2, triggerIds: [first.triggerId] }); expect(fresh.epoch).toBeGreaterThan(old.epoch);
+    await r.decide(fresh.id, fresh.epoch, { kind: 'ignore', reason: 'first' }, { commandId: 'fresh' });
+    const [next] = await r.listCandidates(); expect(next).toMatchObject({ policyVersion: 2, triggerIds: [second.triggerId] });
+    await r.decide(next.id, next.epoch, { kind: 'ignore', reason: 'second' }, { commandId: 'next' });
+    expect((await r.engine.store.read('state', 'intake')).count).toBe(0);
+  });
+  it('policy revocation explicitly settles pending and queued work without leaking capacity', async () => {
+    const r = await open(); await r.updatePolicy(policy('auto'), alice, { commandId: 'p1' });
+    await r.receive(event('first')); await r.receive(event('second'));
+    await r.updatePolicy({ ...policy('auto', 2), allowedActors: [] }, alice, { commandId: 'revoke' });
+    expect(await r.listCandidates()).toEqual([]);
+    expect((await r.list('disposition')).every(d => d.acknowledged)).toBe(true);
+    expect((await r.engine.store.read('state', 'intake')).count).toBe(0);
+  });
+
+  it('overlapping multi-Thread inputs share one pending boundary and the queue survives reopen', async () => {
+    const r = await open(); await r.updatePolicy(policy('auto'), alice, { commandId: 'p' });
+    const first = await r.receive(event('first', { threads: ['one', 'two'] })); const [active] = await r.listCandidates();
+    const second = await r.receive(event('second', { threads: ['two'] }));
+    expect(await r.listCandidates()).toMatchObject([{ triggerIds: [first.triggerId] }]);
+    const directory = dirs[dirs.length - 1]; await r.close();
+    const reopened = await openSuperAgent({ directory }); runtimes.push(reopened);
+    await reopened.decide(active.id, active.epoch, { kind: 'ignore', reason: 'first' }, { commandId: 'first' });
+    expect(await reopened.listCandidates()).toMatchObject([{ triggerIds: [second.triggerId] }]);
+  });
+
 });

@@ -102,7 +102,7 @@ export interface Policy {
   explicitCapabilities?: string[];
   rules: Rule[];
 }
-export interface CommandMeta { commandId: string; expectedRevision?: number }
+export interface CommandMeta { commandId: string; expectedRevision?: number; /** Authenticated source input consumed by a stop command. */ triggerId?: ID }
 export interface Mandate {
   id: ID; actor: Actor; basis: 'explicit' | 'inferred'; policyVersion: number;
   ruleIds: ID[]; capabilities: string[]; sourceId: ID; scope: string[]; withdrawnAt: number | null;
@@ -114,7 +114,7 @@ export interface Ticket {
 }
 export interface Assignment { id: ID; ticketId: ID; epoch: number; status: 'pending' | 'running' | 'ended' | 'stopped' }
 export interface Eval {
-  id: ID; threadId: ID; triggerIds: ID[]; policyVersion: number; epoch: number;
+  id: ID; threadId: ID; threadIds?: ID[]; triggerIds: ID[]; policyVersion: number; epoch: number;
   status: 'pending' | 'decided' | 'invalid'; basis: 'explicit' | 'inferred';
   actor: Actor; sourceId: ID; decisionId?: ID;
 }

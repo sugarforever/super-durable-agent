@@ -93,13 +93,13 @@ describe('ownership routing on real pi SQLite', () => {
     expect(await r.readTicket(a.id)).toMatchObject({ lifecycle: 'ended' });
     expect((await r.list('delivery')).filter(d => d.triggerId !== (a as any).triggerId && d.resume === true)).toHaveLength(1); // initial acceptance only
   });
-  it('requeues a settled owner input with a distinct Eval and reserves capacity again', async () => {
+  it('transport receipts retain unread ownership capacity and handback uses a distinct Eval', async () => {
     const r = await open(); const a = await ticket(r, 'a');
     const original = (await r.list('eval'))[0];
     const delivery = (await r.list('delivery'))[0];
     await r.engine.transaction(tx => r.engine.authorization.acknowledgeDeliveryInTransaction(tx, delivery.id));
     await r.engine.transaction(tx => r.engine.authorization.acknowledgeDeliveryInTransaction(tx, delivery.id));
-    expect((await r.engine.store.read('state', 'intake')).count).toBe(0);
+    expect((await r.engine.store.read('state', 'intake')).count).toBe(1);
     await r.handback(a.id, delivery.triggerId, 1, 'release', { commandId: 'return-initial' });
     const [fresh] = await r.listCandidates();
     expect(fresh.id).not.toBe(original.id);
@@ -128,7 +128,8 @@ describe('ownership routing on real pi SQLite', () => {
     await r.engine.transaction(tx => r.engine.authorization.acknowledgeDeliveryInTransaction(tx, delivery.id));
     expect((await r.list('delivery'))[0].status).toBe('invalid');
     expect(await r.readTicket(a.id)).toMatchObject({ lifecycle: 'stopped', assignmentEpoch: 2 });
-    expect((await r.engine.store.read('state', 'intake')).count).toBe(0);
+    expect((await r.engine.store.read('state', 'intake')).count).toBe(1);
+    expect(await r.listCandidates()).toHaveLength(1); // unread input was returned to Router, not discarded
   });
   it('current source permissions filter subscriptions on each thread before fanout', async () => {
     const r = await open(); const a = await ticket(r, 'a');
@@ -163,15 +164,111 @@ describe('ownership routing on real pi SQLite', () => {
     await r.decide(c.id, c.epoch, { kind: 'attach', ticketId: a.id }, { commandId: 'attach-after-receipt' });
     expect((await r.list('delivery')).filter(d => d.triggerId === received.triggerId && d.status === 'pending')).toMatchObject([{ own: true, resume: true }]);
   });
-  it('requeued bot work clears the previous ignore acknowledgement', async () => {
+  it('owner handback preserves a previous ignored bot evaluation acknowledgement', async () => {
     const r = await open(); const a = await ticket(r, 'a');
     await r.subscribe(a.id, 'cli', 'owned', true, { commandId: 'sub' });
     const received = await r.receive(event('bot-owned', { actor: bot, threads: ['owned'] }));
     const [c] = await r.listCandidates();
     await r.decide(c.id, c.epoch, { kind: 'ignore', reason: 'handled by owner' }, { commandId: 'ignore' });
     await r.handback(a.id, received.triggerId, 1, 'cannot handle', { commandId: 'back' });
+    expect(await r.listCandidates()).toEqual([]);
+    expect((await r.list('disposition')).find(d => d.triggerId === received.triggerId).acknowledged).toBe(true);
+  });
+
+  it('stop releases one unread owner and the final owner handback requeues once', async () => {
+    const r = await open(); const a = await ticket(r, 'a'), b = await ticket(r, 'b');
+    for (const t of [a, b]) await r.subscribe(t.id, 'cli', 'shared', true, { commandId: `${t.goal}-sub` });
+    const received = await r.receive(event('shared-unread', { threads: ['shared'] }));
+    await r.stopTicket(a.id, alice, { commandId: 'stop-a' });
+    expect((await r.listCandidates()).filter(c => c.triggerIds.includes(received.triggerId))).toEqual([]);
+    await r.handback(b.id, received.triggerId, 1, 'release', { commandId: 'b-back' });
+    await r.handback(b.id, received.triggerId, 1, 'release', { commandId: 'b-back' });
+    expect((await r.listCandidates()).filter(c => c.triggerIds.includes(received.triggerId))).toHaveLength(1);
+    expect((await r.list('disposition')).find(d => d.triggerId === received.triggerId).handbacks).toHaveLength(2);
+  });
+  it('ending an owner requeues unread feedback but preserves acknowledged inputs', async () => {
+    const r = await open(); const a = await ticket(r, 'a');
+    const [initial] = await r.list('delivery');
+    await r.engine.transaction(tx => r.engine.authorization.acknowledgeInputInTransaction(tx, a.id, initial.triggerId, 1));
+    const unread = await r.receive(event('unread', { threads: ['a'] }));
+    await r.endTicket(a.id, 1, { commandId: 'end' });
+    await r.endTicket(a.id, 1, { commandId: 'end' });
+    expect(await r.listCandidates()).toMatchObject([{ triggerIds: [unread.triggerId] }]);
+    expect((await r.list('disposition')).find(d => d.triggerId === initial.triggerId).acknowledged).toBe(true);
+  });
+  it('naturally ended own-human feedback revalidates and resumes the same Ticket and Worker', async () => {
+    const r = await open(); const a = await ticket(r, 'a');
+    const [initial] = await r.list('delivery');
+    await r.engine.transaction(async tx => {
+      await r.engine.authorization.acknowledgeInputInTransaction(tx, a.id, initial.triggerId, 1);
+      await r.engine.store.put(tx, 'ticket', a.id, { ...a, workerConversationId: 'worker-binding' });
+    });
+    await r.endTicket(a.id, 1, { commandId: 'end' });
+    const feedback = await r.receive(event('follow-up', { threads: ['a'] }));
+    expect(await r.readTicket(a.id)).toMatchObject({ lifecycle: 'open', mandateId: a.mandateId, workerConversationId: 'worker-binding', assignmentEpoch: 2 });
+    expect(await r.list('ticket')).toHaveLength(1); expect(await r.list('mandate')).toHaveLength(1);
+    expect(await r.listCandidates()).toEqual([]);
+    expect((await r.list('delivery')).find(d => d.triggerId === feedback.triggerId)).toMatchObject({ ticketId: a.id, epoch: 2, own: true, resume: true });
+    expect(await r.list('assignment')).toHaveLength(2);
+  });
+  it('ended work cannot resume after its capability authority is revoked', async () => {
+    const r = await open(); const a = await ticket(r, 'a');
+    const [initial] = await r.list('delivery');
+    await r.engine.transaction(tx => r.engine.authorization.acknowledgeInputInTransaction(tx, a.id, initial.triggerId, 1));
+    await r.endTicket(a.id, 1, { commandId: 'end' });
+    await r.updatePolicy({ version: 2, acceptMode: 'auto', allowedActors: ['alice'], botActors: ['bot'], explicitCapabilities: [], rules: [] }, alice, { commandId: 'revoke' });
+    await r.receive(event('new-request', { threads: ['a'] }));
+    expect(await r.readTicket(a.id)).toMatchObject({ lifecycle: 'ended', assignmentEpoch: 1 });
+    expect((await r.list('mandate'))[0].withdrawnAt).toEqual(expect.any(Number));
     expect(await r.listCandidates()).toHaveLength(1);
-    expect((await r.list('disposition')).find(d => d.triggerId === received.triggerId).acknowledged).toBe(false);
+  });
+
+  it('an authenticated stop input is consumed rather than requeued as unread feedback', async () => {
+    const r = await open(); const a = await ticket(r, 'a');
+    const [initial] = await r.list('delivery');
+    await r.engine.transaction(tx => r.engine.authorization.acknowledgeInputInTransaction(tx, a.id, initial.triggerId, 1));
+    const stop = await r.receive(event('stop-message', { threads: ['a'] }));
+    await r.stopTicket(a.id, alice, { commandId: 'stop-input', triggerId: stop.triggerId });
+    expect(await r.listCandidates()).toEqual([]);
+    expect((await r.list('disposition')).find(d => d.triggerId === stop.triggerId).acknowledged).toBe(true);
+    expect((await r.engine.store.read('state', 'intake')).count).toBe(0);
+  });
+  it('bot and context-only input cannot automatically reopen naturally ended work', async () => {
+    const r = await open(); const a = await ticket(r, 'a');
+    await r.subscribe(a.id, 'cli', 'context', false, { commandId: 'ctx' });
+    const [initial] = await r.list('delivery');
+    await r.engine.transaction(tx => r.engine.authorization.acknowledgeInputInTransaction(tx, a.id, initial.triggerId, 1));
+    await r.endTicket(a.id, 1, { commandId: 'end' });
+    await r.receive(event('bot-followup', { actor: bot, threads: ['a'] }));
+    await r.receive(event('context-followup', { threads: ['context'] }));
+    expect(await r.readTicket(a.id)).toMatchObject({ lifecycle: 'ended', assignmentEpoch: 1 });
+    expect((await r.list('delivery')).filter(d => d.triggerId !== initial.triggerId).every(d => !d.resume && !d.own)).toBe(true);
+  });
+
+  it('a new authenticated stop input is consumed even when the Ticket is already stopped', async () => {
+    const r = await open(); const a = await ticket(r, 'a');
+    const [initial] = await r.list('delivery');
+    await r.engine.transaction(tx => r.engine.authorization.acknowledgeInputInTransaction(tx, a.id, initial.triggerId, 1));
+    await r.stopTicket(a.id, alice, { commandId: 'stop-first' });
+    const stop = await r.receive(event('stop-again', { threads: ['a'] }));
+    await r.stopTicket(a.id, alice, { commandId: 'stop-again', triggerId: stop.triggerId });
+    expect(await r.listCandidates()).toEqual([]);
+    expect((await r.engine.store.read('state', 'intake')).count).toBe(0);
+    expect(await r.list('cancel')).toHaveLength(1);
+  });
+
+  it('multiple final-owner releases queue behind one Thread Eval across a policy update', async () => {
+    const r = await open(); const a = await ticket(r, 'a');
+    const [initial] = await r.list('delivery');
+    await r.engine.transaction(tx => r.engine.authorization.acknowledgeInputInTransaction(tx, a.id, initial.triggerId, 1));
+    const first = await r.receive(event('unread-one', { threads: ['a'] }));
+    const second = await r.receive(event('unread-two', { threads: ['a'] }));
+    await r.endTicket(a.id, 1, { commandId: 'end' });
+    expect(await r.listCandidates()).toMatchObject([{ triggerIds: [first.triggerId] }]);
+    await r.updatePolicy({ version: 2, acceptMode: 'auto', allowedActors: ['alice'], botActors: ['bot'], rules: [] }, alice, { commandId: 'p2' });
+    const [fresh] = await r.listCandidates(); expect(fresh.policyVersion).toBe(2);
+    await r.decide(fresh.id, fresh.epoch, { kind: 'ignore', reason: 'first handled' }, { commandId: 'first-handled' });
+    expect(await r.listCandidates()).toMatchObject([{ policyVersion: 2, triggerIds: [second.triggerId] }]);
   });
 
 });
