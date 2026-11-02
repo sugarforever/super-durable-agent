@@ -6,7 +6,7 @@ Each row corresponds to one requirement issue and one incremental PR. A PR targe
 | --- | --- | --- | --- | --- | --- |
 | 1 | English architecture and executable design checkpoints | [#1](https://github.com/sugarforever/super-durable-agent/issues/1) | [#11](https://github.com/sugarforever/super-durable-agent/pull/11) | `main` | Implemented; user approval pending |
 | 2 | Persistent domain kernel and single-writer runtime | [#2](https://github.com/sugarforever/super-durable-agent/issues/2) | [#12](https://github.com/sugarforever/super-durable-agent/pull/12) | `codex/01-design-baseline` | Implemented; user approval pending |
-| 3 | Authorization and subscription ownership | [#3](https://github.com/sugarforever/super-durable-agent/issues/3) | Pending | `codex/02-domain-kernel` | Planned |
+| 3 | Authorization and subscription ownership | [#3](https://github.com/sugarforever/super-durable-agent/issues/3) | [#13](https://github.com/sugarforever/super-durable-agent/pull/13) | `codex/02-domain-kernel` | Implemented; user approval pending |
 | 4 | Router and Worker conversations with durable delivery | [#4](https://github.com/sugarforever/super-durable-agent/issues/4) | Pending | `codex/03-policy-ownership` | Planned |
 | 5 | Capacity scheduling and cancellation fencing | [#5](https://github.com/sugarforever/super-durable-agent/issues/5) | Pending | `codex/04-agent-conversations` | Planned |
 | 6 | Local environments and asynchronous jobs | [#6](https://github.com/sugarforever/super-durable-agent/issues/6) | Pending | `codex/05-scheduling-cancellation` | Planned |
@@ -55,3 +55,7 @@ Implementation commit `bbb2542`. 19 integration tests pass, including real SQLit
 | D10 | Incompatible state fails closed before effects; restore validates integrity | Parts 2, 4, 10: preflight, migration and offline restore |
 | D11 | External identity is verified and cannot be forged in body text | Parts 8–9: GitHub, API, daemon and Feishu authentication |
 | D12 | Supervision is independent, budgeted and quiet when unchanged | Part 10: wait classifications, budget and notification deduplication |
+
+## Part 3 evidence
+
+Implementation commit `242759c`. 57 real SQLite tests pass (19 kernel, 17 policy, 21 ownership), plus typecheck/build, seven pi probes, and English-document checks. Scoped review and one correction round resolved all four important findings: per-Thread Eval serialization, Policy reevaluation, unread-owner release, and same-Ticket resumption. No model or external sender execution is claimed by this part. Independent scoped specification/quality review completed with important findings resolved. User approval and merge remain pending.
