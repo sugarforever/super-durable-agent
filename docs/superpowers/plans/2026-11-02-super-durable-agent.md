@@ -200,8 +200,8 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 - [x] Add behavioral tests first and confirm the intended missing behavior fails.
 - [x] Implement the scoped feature and required integration through existing public boundaries.
 - [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Completion rules
 

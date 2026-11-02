@@ -13,7 +13,7 @@ Each row corresponds to one requirement issue and one incremental PR. A PR targe
 | 7 | Transactional Outbox and external effect recovery | [#7](https://github.com/sugarforever/super-durable-agent/issues/7) | [#17](https://github.com/sugarforever/super-durable-agent/pull/17) | `codex/06-environments-jobs` | Implemented; user approval pending |
 | 8 | CLI, GitHub integration and management API | [#8](https://github.com/sugarforever/super-durable-agent/issues/8) | [#18](https://github.com/sugarforever/super-durable-agent/pull/18) | `codex/07-outbox` | Implemented; user approval pending |
 | 9 | Remote endpoint daemon and Feishu integration | [#9](https://github.com/sugarforever/super-durable-agent/issues/9) | [#19](https://github.com/sugarforever/super-durable-agent/pull/19) | `codex/08-github-management` | Implemented; user approval pending |
-| 10 | Independent Watchdog and operational recovery | [#10](https://github.com/sugarforever/super-durable-agent/issues/10) | Pending | `codex/09-remote-feishu` | Planned |
+| 10 | Independent Watchdog and operational recovery | [#10](https://github.com/sugarforever/super-durable-agent/issues/10) | [#20](https://github.com/sugarforever/super-durable-agent/pull/20) | `codex/09-remote-feishu` | Implemented; user approval pending |
 
 ## Required evidence per checkpoint
 
@@ -82,4 +82,8 @@ Implementation commit `7475ff8`. 198 tests across ten files pass, plus typecheck
 
 ## Part 9 evidence
 
-Implementation commit `775da5b`. 237 tests across thirteen files pass, plus typecheck/build, seven pi probes and nine English-document checks. Scoped correction review resolved operation-only cancellation versus Ticket revocation and concurrent Feishu disable acknowledgment; deterministic CI barriers retain recovery assertions. A separate pre-existing queued-operation cancellation gap is a required final integration gate in issue #10. No live device/account/model trial was executed. Independent scoped specification/quality review completed with important findings resolved. User approval and merge remain pending.
+Implementation commit `775da5b`. 237 tests across thirteen files pass, plus typecheck/build, seven pi probes and nine English-document checks. Scoped correction review resolved operation-only cancellation versus Ticket revocation and concurrent Feishu disable acknowledgment; deterministic CI barriers retain recovery assertions. The separately identified queued-operation cancellation gap was addressed and verified in [Part 10 / PR #20](https://github.com/sugarforever/super-durable-agent/pull/20). No live device/account/model trial was executed. Independent scoped specification/quality review completed with important findings resolved. User approval and merge remain pending.
+
+## Part 10 evidence
+
+Implementation commit `c46afb6`. 276 tests across fifteen files pass, plus typecheck/build, seven pi probes and ten English-document checks. Independent scoped and whole-stack reviews resolved all five final findings; three independent final-head probes pass. Controlled native E2E covers two Workers, queued/long Job cancellation, restart, Reports/Outbox, PR closure and preserved Git changes across resume/retry. Backups require original local endpoint dependencies; remote/custom restored clones remain inspection-only. No live provider/account/device/TLS trial was executed. Independent scoped specification/quality review completed with important findings resolved. User approval and merge remain pending.

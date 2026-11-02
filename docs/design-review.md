@@ -34,3 +34,9 @@ Before each PR opens for approval, its checkpoint must record executable evidenc
 | 10 | Validate frozen prompt artifacts as required backup dependencies | [Recovery tests](../tests/recovery.spec.ts) |
 
 These corrections retain the original organization while making its state transitions explicit at pi's transactional and invocation boundaries. Controlled-provider tests exercise native execution; they do not establish real-model quality or live external-service behavior.
+
+## Whole-stack review result
+
+The aggregate runtime through `c46afb6` completed independent specification and cross-layer review. All five final recovery findings are addressed: unknown Document definitions, released and unused endpoint backup states, automatic late remote Job receipt reconciliation, and missing frozen prompt artifacts. No unresolved Critical or Important finding remains in that review.
+
+Final automated validation passes 276 tests across 15 files, seven native pi contract probes, typecheck/build, and ten English-document/link checks. The reviewer independently replayed three focused final-head probes covering both remote transports and intact/missing frozen-prompt recovery with full recall. Real-provider quality and live GitHub/Feishu/device/TLS trials remain unexecuted. Review readiness does not constitute user approval or merge.
