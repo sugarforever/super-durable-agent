@@ -84,6 +84,8 @@ Worker tools start_job, get_job, stop_job, read_file, write_file, and edit_file 
 
 Broker prepare, execute, query, cancel, and release operations bind stable IDs to canonical payload digests and Ticket/Assignment/Mandate identity. Local preparation records an immutable base commit and uses a detached per-Ticket worktree. Repeated preparation preserves changes; unknown paths are never reset or overwritten. Structured operations reject traversal, repository metadata access, and symlink escapes. An unavailable requested sandbox is an error. These checks assume no hostile concurrent filesystem writer; they are not an OS sandbox.
 
+Admitted Jobs with running or uncertain outcomes receive durable query-only receipt checks. Each finite native Task queries the original operation once; persisted backoff grows from 2 seconds to a 60-second cap, with at most one live claim per Job and eight per runtime. Startup resumes unfinished claims and schedules due checks. Absence or query failure never authorizes another execution. An authoritative terminal receipt updates accounting and gives the current Worker a distinct deduplicated result after an earlier uncertainty notice; stopped or old-epoch results remain accounting-only. Only the matching resolved Job-only attention may clear.
+
 Shell Jobs require command.execute and explicit trustedLocalShell configuration. Output is bounded. If a process dies after command admission without a trustworthy completion receipt, recovery records unknown and quarantines its reservation; it does not execute the command again. Cancel confirms process termination where observable, without claiming external effects were undone.
 
 ## Transactional Outbox

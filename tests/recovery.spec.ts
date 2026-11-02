@@ -570,3 +570,27 @@ it("backs up a safely unused configured local endpoint and activates the restore
   await expect(offlineBackup(f.directory, join(f.home, "missing-ledger"))).rejects.toThrow(/ENOENT|endpoint|dependency/i);
   await expect(openSuperAgent({ directory: f.directory, environment: f.environment }).then(async opened => { await opened.close(); })).rejects.toThrow(/ENOENT|endpoint|dependency/i);
 }, 15000);
+
+
+it("refuses a missing frozen native delivery promptArtifact before completing backup", async () => {
+  const { createModels } = await import("@earendil-works/pi-ai/models");
+  const { fauxProvider } = await import("@earendil-works/pi-ai/providers/faux");
+  const { alice, event } = await import("./helpers/scheduling.js");
+  const home = await root(), directory = join(home, "runtime");
+  let r = await openSuperAgent({ directory });
+  await r.updatePolicy({ version: 1, acceptMode: "auto", allowedActors: ["alice"], botActors: [], rules: [] }, alice, { commandId: "policy" });
+  await r.receive({ ...event("large"), body: "x".repeat(16000) });
+  const candidate = (await r.listCandidates())[0];
+  await r.decide(candidate.id, candidate.epoch, { kind: "accept", goal: "large", ruleIds: [] }, { commandId: "accept" });
+  await r.close();
+  const faux = fauxProvider(), models = createModels(); models.setProvider(faux.provider);
+  r = await openSuperAgent({ directory, startPaused: true, models, model: { provider: faux.getModel().provider, modelId: faux.getModel().id } });
+  await r.agents!.pump();
+  const artifact = (await r.list<any>("deliveryRun"))[0].promptArtifact;
+  expect(artifact).toMatch(/^[a-f0-9]{64}$/);
+  await r.close();
+  await rm(join(directory, "artifacts", artifact));
+  const archive = join(home, "archive");
+  await expect(offlineBackup(directory, archive)).rejects.toThrow(/Referenced artifact is missing/);
+  await expect(readFile(join(archive, "manifest.json"))).rejects.toThrow();
+});

@@ -311,6 +311,7 @@ export async function openSuperAgent(
     await reconcile(engine);
     await engine.transaction(tx => engine.lifecycle.completeInTransaction(tx));
     await outbox.reconcile();
+    await coordinator.jobs.receipts.reconcile();
     // An explicit model activates execution. A model-free recovery keeps live
     // agent tasks durable and paused; domain receives/commands still commit.
     const recoveredAgentWork =
@@ -371,6 +372,7 @@ export async function openSuperAgent(
         (closing ??= (async () => {
           try {
             outbox.close();
+            coordinator.jobs.receipts.close();
             await coordinator.close();
             await openedHarness.close(context);
           } finally {

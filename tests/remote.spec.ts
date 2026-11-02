@@ -621,7 +621,7 @@ it("fails closed when previously delivered controller state loses its pinned dae
   );
 });
 
-async function nativeRemote(mode: "http" | "poll") {
+async function nativeRemote(mode: "http" | "poll", lateReceipt = false) {
   const { openSuperAgent } = await import("../src/runtime/open.js");
   const { createModels } = await import("@earendil-works/pi-ai/models");
   const { fauxProvider, fauxAssistantMessage, fauxToolCall } =
@@ -660,7 +660,9 @@ async function nativeRemote(mode: "http" | "poll") {
           fauxToolCall("start_job", {
             assignmentId: accepted.assignmentId,
             epoch: 1,
-            command: `printf begun > '${join(f.root, "native-begun")}'; sleep 10`,
+            command: lateReceipt
+              ? `printf begun >> '${join(f.root, "native-begun")}'; while [ ! -f '${join(f.root, "finish-job")}' ]; do sleep 0.01; done`
+              : `printf begun > '${join(f.root, "native-begun")}'; sleep 10`,
           }),
           { stopReason: "toolUse" },
         );
@@ -692,7 +694,15 @@ async function nativeRemote(mode: "http" | "poll") {
   const firstJob = (await r.list<any>("job"))[0],
     ticket = await r.readTicket<any>(accepted.id),
     jobs = r.agents!.jobs;
-  return { ...f, r, firstJob, ticket, jobs, release, until };
+  return { ...f, r, firstJob, ticket, jobs, release, until,
+    async restart(startPaused = false) {
+      release(); await r.close();
+      r = await openSuperAgent({ directory, models, startPaused,
+        model: { provider: faux.getModel().provider, modelId: faux.getModel().id },
+        environment: { broker: f.broker } });
+      this.r = r;
+    },
+  };
 }
 
 for (const mode of ["http", "poll"] as const) {
@@ -1289,3 +1299,96 @@ it("HTTP per-operation cancellation fences an execute suspended in its async aut
     ),
   ).toMatchObject({ status: "completed" });
 });
+
+
+for (const mode of ["http", "poll"] as const) {
+  for (const restart of [false, true]) it(`${mode}: late Job completion reconciles without get_job${restart ? " across restart" : ""}`, async () => {
+    const f = await nativeRemote(mode, true);
+    async function waitFor(fn: () => Promise<boolean>) {
+      for (let n = 0; n < 1000; n++) { if (await fn()) return; await delay(10); }
+      throw Error("Late receipt did not reconcile");
+    }
+    await waitFor(async () => (await f.r.engine.store.read<any>("job", f.firstJob.id))?.status === "unknown");
+    if (restart) f.release();
+    await f.r.agents!.pump();
+    if (!restart) expect((await f.r.readTicket<any>(f.ticket.id)).attention).toBe("Job outcome unknown; inspect endpoint before continuing");
+    const unknownNotes = (await f.r.list<any>("workerNote")).filter(n => n.jobId === f.firstJob.id);
+    expect(unknownNotes).toHaveLength(1);
+    if (restart) {
+      await f.restart(true);
+      // Persist a genuinely unfinished native query claim, then reopen with its
+      // future deadline. A live claim must resume; due time only gates new claims.
+      await f.r.engine.transaction(async tx => {
+        const job = (await f.r.engine.store.get<any>(tx, "job", f.firstJob.id))!;
+        const old = job.receiptTaskId ? await tx.task(job.receiptTaskId) : undefined;
+        const taskId = old && old.state.status !== "terminal" ? old.id : await tx.createTask(f.r.agents!.jobs.task,
+          { jobId: job.id, queryOnly: true }, { ownership: { kind: "conversation" }, background: true });
+        await f.r.engine.store.put(tx, "job", job.id, { ...job, receiptTaskId: taskId, receiptQueryAt: Date.now() + 60000 });
+      });
+      await writeFile(join(f.root, "finish-job"), "go");
+      await f.restart();
+    }
+    await writeFile(join(f.root, "finish-job"), "go");
+    await waitFor(async () => (await f.r.engine.store.read<any>("job", f.firstJob.id))?.status === "completed");
+    if (!restart) expect((await f.r.readTicket<any>(f.ticket.id)).attention).toBeUndefined();
+    f.release();
+    await f.r.agents!.pump();
+    const notes = (await f.r.list<any>("workerNote")).filter(n => n.jobId === f.firstJob.id);
+    expect(notes.map(n => JSON.parse(n.text).receipt.status).sort()).toEqual(["completed", "unknown"]);
+    expect(new Set(notes.map(n => n.id)).size).toBe(2);
+    await waitFor(async () => (await f.r.list<any>("deliveryRun")).filter(run => notes.some(n => n.id === run.id) && run.submissionId).length === 2);
+    expect((await f.r.readTicket<any>(f.ticket.id)).attention).not.toBe("Job outcome unknown; inspect endpoint before continuing");
+    await f.r.agents!.pump();
+    expect((await f.r.list<any>("workerNote")).filter(n => n.jobId === f.firstJob.id)).toHaveLength(2);
+    expect(await readFile(join(f.root, "native-begun"), "utf8")).toBe("begun");
+    expect((await f.broker.query(f.firstJob.operationId))?.status).toBe("completed");
+    const completed = await f.r.engine.store.read<any>("job", f.firstJob.id);
+    const query = f.broker.query.bind(f.broker);
+    let queries = 0;
+    f.broker.query = async id => { queries++; return query(id); };
+    try {
+      // Replaying either the old execution claim or terminal query claim is inert.
+      await f.r.agents!.jobs.receipts.run(completed.id, completed.taskId);
+      await f.r.agents!.jobs.receipts.run(completed.id, completed.receiptTaskId);
+      expect(queries).toBe(0);
+    } finally { f.broker.query = query; }
+  }, 25000);
+}
+
+
+for (const mode of ["http", "poll"] as const) it(`${mode}: late query receipt after stop remains accounting-only`, async () => {
+  const { alice } = await import("./helpers/scheduling.js");
+  const f = await nativeRemote(mode, true);
+  const waitFor = async (fn: () => Promise<boolean>) => {
+    for (let n = 0; n < 1000; n++) { if (await fn()) return; await delay(10); }
+    throw Error("Late accounting did not settle");
+  };
+  await waitFor(async () => (await f.r.engine.store.read<any>("job", f.firstJob.id))?.status === "unknown");
+  f.release();
+  await f.restart();
+  const query = f.broker.query.bind(f.broker);
+  let entered = false, release!: () => void;
+  const gate = new Promise<void>(resolve => release = resolve);
+  f.broker.query = async id => {
+    const receipt = await query(id);
+    if (id === f.firstJob.operationId && receipt?.status === "completed" && !entered) {
+      entered = true; await gate;
+    }
+    return receipt;
+  };
+  try {
+    await writeFile(join(f.root, "finish-job"), "go");
+    await waitFor(async () => entered);
+    expect((await f.r.engine.store.read<any>("job", f.firstJob.id)).receiptTaskId).toBeTruthy();
+    await f.r.agents!.close();
+    await f.r.stopTicket(f.ticket.id, alice, { commandId: "stop-before-late-query" });
+    const stopped = await f.r.readTicket<any>(f.ticket.id);
+    release();
+    await waitFor(async () => (await f.r.engine.store.read<any>("job", f.firstJob.id))?.status === "completed");
+    expect(await f.r.readTicket<any>(f.ticket.id)).toEqual(stopped);
+    const notes = (await f.r.list<any>("workerNote")).filter(n => n.jobId === f.firstJob.id);
+    expect(notes).toHaveLength(1);
+    expect(JSON.parse(notes[0].text).receipt.status).toBe("unknown");
+    expect(await readFile(join(f.root, "native-begun"), "utf8")).toBe("begun");
+  } finally { release(); f.broker.query = query; }
+}, 25000);

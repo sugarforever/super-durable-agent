@@ -314,7 +314,7 @@ export async function backupRuntime(
       if (!value || typeof value !== "object") return;
       for (const [key, item] of Object.entries(value)) {
         if (
-          /^(bodyArtifact|goalArtifact|artifact|artifactId)$/.test(key) &&
+          /^(bodyArtifact|goalArtifact|promptArtifact|artifact|artifactId)$/.test(key) &&
           typeof item === "string" &&
           /^[a-f0-9]{64}$/.test(item)
         )
