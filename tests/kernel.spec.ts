@@ -140,6 +140,8 @@ describe('persistent domain kernel', () => {
 
   it('persists source filters and commits a batch cursor only with its events', async () => {
     const { runtime, directory } = await open({ maxPending: 2 });
+    // Capacity now bounds routed work; admit alice so these events retain pending Evals.
+    await runtime.updatePolicy({ version: 1, acceptMode: 'observe', allowedActors: ['alice'], botActors: [], rules: [] }, event().actor, { commandId: 'admit-alice' });
     expect((await runtime.receive(event({ sourceId: 'github' }))).disposition).toBe('filtered');
     await runtime.engine.configureSource({ id: 'cli', kind: 'cli', enabled: true, listenedScopes: ['allowed'] });
     expect((await runtime.receive(event())).disposition).toBe('filtered');

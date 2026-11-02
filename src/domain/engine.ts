@@ -1,6 +1,8 @@
 import type { Context, JsonValue } from '@earendil-works/chord';
 import { defineTask, type Conversation, type Harness, type Tx } from '@earendil-works/pi-durable';
 import { DomainStore } from './store.js';
+import { PolicyController } from './policy.js';
+import type { Actor, CommandMeta, DecisionOutcome, Policy } from './model.js';
 import { digest, normalizeEvent, scopedId, type AuditEvent, type IntakeIntent, type NormalizedEvent,
   type ReceiveBatchResult, type ReceiveResult, type Source, type SourceCursor, type Thread, type Trigger } from './model.js';
 export type { Tx } from '@earendil-works/pi-durable';
@@ -28,6 +30,17 @@ export function createIntakeTask(store: DomainStore) {
   });
 }
 export class Engine {
+  readonly authorization = new PolicyController(this);
+
+  updatePolicy(policy: Policy, actor: Actor, meta: CommandMeta) { return this.authorization.updatePolicy(policy, actor, meta); }
+  listCandidates() { return this.authorization.listCandidates(); }
+  decide(evalId: string, epoch: number, outcome: DecisionOutcome, meta: CommandMeta) { return this.authorization.decide(evalId, epoch, outcome, meta); }
+  subscribe(ticketId: string, sourceId: string, threadRef: string, own: boolean, meta: CommandMeta) { return this.authorization.subscribe(ticketId, sourceId, threadRef, own, meta); }
+  unsubscribe(ticketId: string, sourceId: string, threadRef: string, meta: CommandMeta) { return this.authorization.unsubscribe(ticketId, sourceId, threadRef, meta); }
+  handback(ticketId: string, triggerId: string, epoch: number, reason: string, meta: CommandMeta) { return this.authorization.handback(ticketId, triggerId, epoch, reason, meta); }
+  stopTicket(ticketId: string, actor: Actor, meta: CommandMeta) { return this.authorization.stopTicket(ticketId, actor, meta); }
+  endTicket(ticketId: string, epoch: number, meta: CommandMeta) { return this.authorization.endTicket(ticketId, epoch, meta); }
+
   constructor(
     readonly harness: Harness,
     readonly control: Conversation,
@@ -102,7 +115,7 @@ export class Engine {
     }
   }
 
-  private async receiveInTransaction(tx: Tx, event: NormalizedEvent): Promise<ReceiveResult> {
+  async receiveInTransaction(tx: Tx, event: NormalizedEvent): Promise<ReceiveResult> {
     const id = scopedId(this.instanceId, 'trigger', [event.sourceId, event.externalId, event.revision]);
     const { receivedAt: _receivedAt, ...stablePayload } = event;
     const hash = digest(stablePayload);
@@ -134,6 +147,7 @@ export class Engine {
     const taskId = await tx.createTask(this.intakeTask, { triggerId: id }, { ownership: { kind: 'conversation' }, background: true });
     await this.store.put(tx, 'intake', id, { id, triggerId: id, status: 'pending', taskId } satisfies IntakeIntent);
     await this.store.put(tx, 'state', 'intake', { count: state.count + 1, lastOrdinal: ordinal });
+    await this.authorization.routeInTransaction(tx, trigger);
     return { disposition: 'stored', triggerId: id };
   }
 }

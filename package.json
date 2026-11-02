@@ -12,7 +12,9 @@
     "test": "npm run build && vitest run",
     "typecheck": "tsc --noEmit",
     "build": "tsc",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "check:docs": "node scripts/check-docs.mjs",
+    "check": "npm run typecheck && npm test && npm run verify:pi && npm run check:docs"
   },
   "dependencies": {
     "@earendil-works/chord": "1.1.0",

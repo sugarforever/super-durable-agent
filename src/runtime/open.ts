@@ -8,7 +8,7 @@ import { Harness, createRegistry, defineExtension, type ModelRef, type Conversat
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { DomainStore } from '../domain/store.js';
 import { Engine, createIntakeTask } from '../domain/engine.js';
-import { canonicalJson, type NormalizedEvent, type ReceiveResult, type ReceiveBatchResult, type RuntimeMetadata, type Source, type SourceCursor } from '../domain/model.js';
+import { canonicalJson, type NormalizedEvent, type ReceiveResult, type ReceiveBatchResult, type RuntimeMetadata, type Source, type SourceCursor, type Actor, type Policy, type CommandMeta, type DecisionOutcome, type Eval } from '../domain/model.js';
 
 const openDirectories = new Set<string>();
 export interface OpenOptions {
@@ -26,6 +26,14 @@ export interface SuperAgentRuntime {
   readonly harness: Harness;
   readonly control: Conversation;
   close(): Promise<void>;
+  updatePolicy(policy: Policy, actor: Actor, meta: CommandMeta): Promise<void>;
+  listCandidates(): Promise<Eval[]>;
+  decide(evalId: string, epoch: number, outcome: DecisionOutcome, meta: CommandMeta): Promise<string>;
+  subscribe(ticketId: string, sourceId: string, threadRef: string, own: boolean, meta: CommandMeta): Promise<void>;
+  unsubscribe(ticketId: string, sourceId: string, threadRef: string, meta: CommandMeta): Promise<void>;
+  handback(ticketId: string, triggerId: string, epoch: number, reason: string, meta: CommandMeta): Promise<void>;
+  stopTicket(ticketId: string, actor: Actor, meta: CommandMeta): Promise<void>;
+  endTicket(ticketId: string, epoch: number, meta: CommandMeta): Promise<void>;
   receive(event: NormalizedEvent): Promise<ReceiveResult>;
   receiveBatch(events: NormalizedEvent[], cursor: SourceCursor): Promise<ReceiveBatchResult>;
   readTicket<T = Record<string, unknown>>(id: string): Promise<T | undefined>;
@@ -89,6 +97,14 @@ export async function openSuperAgent(options: OpenOptions): Promise<SuperAgentRu
     let closing: Promise<void> | undefined;
     return {
       engine, harness, control,
+      updatePolicy: (policy, actor, meta) => engine.updatePolicy(policy, actor, meta),
+      listCandidates: () => engine.listCandidates(),
+      decide: (evalId, epoch, outcome, meta) => engine.decide(evalId, epoch, outcome, meta),
+      subscribe: (ticketId, sourceId, threadRef, own, meta) => engine.subscribe(ticketId, sourceId, threadRef, own, meta),
+      unsubscribe: (ticketId, sourceId, threadRef, meta) => engine.unsubscribe(ticketId, sourceId, threadRef, meta),
+      handback: (ticketId, triggerId, epoch, reason, meta) => engine.handback(ticketId, triggerId, epoch, reason, meta),
+      stopTicket: (ticketId, actor, meta) => engine.stopTicket(ticketId, actor, meta),
+      endTicket: (ticketId, epoch, meta) => engine.endTicket(ticketId, epoch, meta),
       close: () => closing ??= (async () => { try { await openedHarness.close(context); } finally { await release(); } })(),
       receive: (event) => engine.receive(event),
       receiveBatch: (events, cursor) => engine.receiveBatch(events, cursor),

@@ -48,6 +48,18 @@ export class DomainStore {
     document.value = JSON.parse(encoded) as JsonValue;
   }
 
+  /** Enumerate the bounded index inside the same transaction as subsequent mutations. */
+  async listInTransaction<T>(tx: Tx, kind: string): Promise<T[]> {
+    family(kind);
+    const index = await tx.doc(indexes, kind, kind);
+    const values: T[] = [];
+    for (const id of index.ids) {
+      const value = await this.get<T>(tx, kind, id);
+      if (value !== undefined) values.push(value);
+    }
+    return values;
+  }
+
   async read<T>(kind: string, id: string): Promise<T | undefined> {
     const document = await this.reader.snapshot(family(kind), id, this.context);
     return document?.present ? JSON.parse(JSON.stringify(document.value)) as T : undefined;

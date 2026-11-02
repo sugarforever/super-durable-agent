@@ -38,3 +38,20 @@ Implementation commit `530303b` establishes the reviewed design baseline. `npm r
 ## Part 2 evidence
 
 Implementation commit `bbb2542`. 19 integration tests pass, including real SQLite reopen, atomic rollback/cursor admission, payload conflicts, CLI subprocesses, second-writer refusal, and SIGKILL lock/checkpoint recovery. Typecheck, build, and seven pi probes pass. Local validation used Node26/macOS; the native addon requires install scripts and a compiler. Routing and models are introduced in later PRs. Independent scoped specification/quality review completed with important findings resolved. User approval and merge remain pending.
+
+## Design invariant traceability
+
+| ID | Invariant | Owning checkpoint and regression area |
+| --- | --- | --- |
+| D1 | One writer; domain state, index, and Task intent commit together | Part 2: lock, rollback, cursor and reopen tests |
+| D2 | Ticket outlives execution; Worker does not inherit Router cancellation | Part 4: ownerless generation and input delivery |
+| D3 | Input text cannot grant authority; proactive acceptance stays within Policy/Mandate | Part 3: admission matrix, capability ceilings and stale Policy |
+| D4 | Own feedback, context-only input, bot events, and multi-owner handback differ | Part 3: subscription and ownership scenarios |
+| D5 | Reused replay key must bind the same canonical payload | Parts 2, 4, 6, 7: command, delivery, Job and Outbox conflicts |
+| D6 | Stop fences progress and queued sends; old receipts reconcile accounting only | Parts 5–7: cancellation and stale-effect races |
+| D7 | Capacity counts preparation/generation/Jobs and retains human intervention | Parts 5–6: reservations, restart and human wakeups |
+| D8 | Long external work does not block the Worker's input loop | Part 6: Job start/feedback/complete sequence |
+| D9 | Unknown non-idempotent effects are not blindly retried | Parts 6–9: command/send/reconnect receipt windows |
+| D10 | Incompatible state fails closed before effects; restore validates integrity | Parts 2, 4, 10: preflight, migration and offline restore |
+| D11 | External identity is verified and cannot be forged in body text | Parts 8–9: GitHub, API, daemon and Feishu authentication |
+| D12 | Supervision is independent, budgeted and quiet when unchanged | Part 10: wait classifications, budget and notification deduplication |

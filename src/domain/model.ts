@@ -25,7 +25,7 @@ export interface Source {
 }
 export interface Trigger extends NormalizedEvent { id: ID; ordinal: number; digest: string }
 export interface Thread { id: ID; sourceId: ID; externalRef: string; triggerIds: ID[]; lastOrdinal: number }
-export interface IntakeIntent { id: ID; triggerId: ID; status: 'pending' | 'accepted'; taskId: TaskId<null> }
+export interface IntakeIntent { id: ID; triggerId: ID; status: 'pending' | 'accepted'; taskId: TaskId<null>; routed?: boolean; released?: boolean }
 export interface AuditEvent { id: ID; kind: 'trigger.received'; triggerId: ID; occurredAt: number }
 export interface RuntimeMetadata {
   schemaVersion: number;
@@ -91,3 +91,48 @@ export function normalizeEvent(event: NormalizedEvent): NormalizedEvent {
     ...(event.addressed === undefined ? {} : { addressed: event.addressed }),
   };
 }
+
+export interface Rule { id: ID; enabled: boolean; instructions: string; capabilities: string[] }
+export interface Policy {
+  version: number;
+  acceptMode: 'off' | 'observe' | 'auto';
+  allowedActors: string[];
+  botActors: string[];
+  /** Trusted upper bound for explicit work; defaults to repo.read and channel.reply. */
+  explicitCapabilities?: string[];
+  rules: Rule[];
+}
+export interface CommandMeta { commandId: string; expectedRevision?: number }
+export interface Mandate {
+  id: ID; actor: Actor; basis: 'explicit' | 'inferred'; policyVersion: number;
+  ruleIds: ID[]; capabilities: string[]; sourceId: ID; scope: string[]; withdrawnAt: number | null;
+}
+export interface Ticket {
+  id: ID; goal: string; mandateId: ID; lifecycle: 'open' | 'ended' | 'stopped'; revision: number;
+  assignmentId: ID; assignmentEpoch: number; workerConversationId?: string;
+  latestReport?: JsonValue; attention?: string;
+}
+export interface Assignment { id: ID; ticketId: ID; epoch: number; status: 'pending' | 'running' | 'ended' | 'stopped' }
+export interface Eval {
+  id: ID; threadId: ID; triggerIds: ID[]; policyVersion: number; epoch: number;
+  status: 'pending' | 'decided' | 'invalid'; basis: 'explicit' | 'inferred';
+  actor: Actor; sourceId: ID; decisionId?: ID;
+}
+export interface Handback { ticketId: ID; epoch: number; reason: string }
+export interface Disposition {
+  triggerId: ID; ownerTickets: ID[]; contextTickets: ID[]; handbacks: Handback[];
+  acknowledged: boolean; epoch: number; conflicts: number; decisionId?: ID;
+}
+export interface Subscription { ticketId: ID; threadId: ID; own: boolean; active: boolean }
+export type DecisionOutcome =
+  | { kind: 'accept'; goal: string; ruleIds: ID[]; capabilities?: string[] }
+  | { kind: 'attach'; ticketId: ID; note?: string }
+  | { kind: 'ignore'; reason: string; wouldAccept?: boolean }
+  | { kind: 'stop'; ticketId: ID; reason: string };
+export interface Decision { id: ID; evalId: ID; epoch: number; policyVersion: number; outcome: DecisionOutcome }
+export interface DeliveryIntent {
+  id: ID; ticketId: ID; triggerId: ID; epoch: number; own: boolean; resume: boolean;
+  status: 'pending' | 'delivered' | 'invalid';
+}
+export interface CancelIntent { id: ID; ticketId: ID; assignmentId: ID; epoch: number; status: 'pending' | 'completed'; reason: string }
+export interface Report { ticketId: ID; assignmentId: ID; epoch: number; content: JsonValue }

@@ -53,6 +53,10 @@ async function main(): Promise<void> {
     let result: unknown;
     switch (command) {
       case 'init':
+        if (!await runtime.engine.store.read('policy', 'current')) {
+          await runtime.updatePolicy({ version: 1, acceptMode: 'observe', allowedActors: ['operator'], botActors: [], rules: [] },
+            { id: 'operator', kind: 'human', trusted: true }, { commandId: 'cli:init:policy' });
+        }
         result = { directory: resolve(directory), instanceId: (await runtime.engine.store.read<RuntimeMetadata>('metadata', 'runtime'))!.instanceId };
         break;
       case 'receive':
