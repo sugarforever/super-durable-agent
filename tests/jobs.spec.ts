@@ -83,7 +83,7 @@ import { openSuperAgent } from '../src/runtime/open.js';
 import { createModels } from '@earendil-works/pi-ai/models';
 import { fauxProvider, fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai/providers/faux';
 import { accept, alice, event, until, isRouter } from './helpers/scheduling.js';
-async function jobRuntime(cancellationHandler?: any) {
+async function jobRuntime(cancellationHandler?: any, commandFor?: (fixture: any) => string) {
   const f = await repo({ trustedLocalShell: true });
   const directory = join(f.root, 'runtime');
   let r = await openSuperAgent({ directory });
@@ -92,7 +92,7 @@ async function jobRuntime(cancellationHandler?: any) {
   const faux = fauxProvider(), models = createModels(); models.setProvider(faux.provider);
   const model = { provider: faux.getModel().provider, modelId: faux.getModel().id };
   let first = true;
-  const command = `printf begun > '${join(f.root, 'begun')}'; while [ ! -f '${join(f.root, 'finish')}' ]; do sleep 0.02; done; printf finished`;
+  const command = commandFor?.(f) ?? `printf begun > '${join(f.root, 'begun')}'; while [ ! -f '${join(f.root, 'finish')}' ]; do sleep 0.02; done; printf finished`;
   faux.setResponses(Array.from({ length: 100 }, () => (ctx: any) => {
     if (isRouter(ctx)) return fauxAssistantMessage('No decision');
     if (first) { first = false; return fauxAssistantMessage(fauxToolCall('start_job', { assignmentId: ticket.assignmentId, epoch: 1, command }), { stopReason: 'toolUse' }); }
@@ -311,4 +311,82 @@ it('records a real broker completion delayed across stop as old-epoch accounting
     expect(await f.r.readTicket<any>(f.ticket.id)).toMatchObject({ lifecycle: 'stopped', revision: stopped.revision, assignmentEpoch: stopped.assignmentEpoch });
     expect((await f.r.list<any>('reservation')).every(x => x.status === 'released')).toBe(true);
   } finally { release(); jobs.finish = original; }
+});
+
+describe('review regressions: endpoint truth and repository identity', () => {
+  it('supervises a same-group TERM-ignoring descendant after the shell leader closes', async () => {
+    const f = await repo({ trustedLocalShell: true });
+    const ready = join(f.root, 'group-ready'), effect = join(f.root, 'group-effect');
+    const execution = f.broker.execute(f.request('same-group', { kind: 'shell', command: `(trap '' TERM; printf ready > '${ready}'; sleep 1.2; printf survived > '${effect}') >/dev/null 2>&1 & wait` }));
+    await until(async () => readFile(ready, 'utf8').then(x => x === 'ready', () => false));
+    const receipt = await f.broker.cancel('same-group', 1);
+    expect(['cancelled','unknown']).toContain(receipt.status);
+    await execution;
+    await new Promise(resolve => setTimeout(resolve, 1400));
+    await expect(readFile(effect, 'utf8')).rejects.toThrow();
+    expect(await f.broker.query('same-group')).toEqual(receipt);
+  });
+  it('refuses prepared replay and normal operations when a retained broker is reopened for another repository', async () => {
+    const a = await repo(), b = await repo();
+    await writeFile(join(a.prepared.cwd, 'source.txt'), 'repo A');
+    const reopened = new LocalEnvironmentBroker({ ...a.configuration, repository: b.repository });
+    await expect(reopened.prepare(a.prepare)).rejects.toThrow(/repository/i);
+    await expect(reopened.execute(a.request('wrong-repository', { kind: 'read', path: 'source.txt' }))).rejects.toThrow(/repository/i);
+    expect(await readFile(join(a.prepared.cwd, 'source.txt'), 'utf8')).toBe('repo A');
+    expect(await readFile(join(b.repository, 'source.txt'), 'utf8')).toBe('original');
+  });
+  it('accepts a canonical alias of the repository while preserving legitimate worktree edits and commits', async () => {
+    const f = await repo(); const alias = join(f.root, 'repository-alias'); await symlink(f.repository, alias);
+    await writeFile(join(f.prepared.cwd, 'source.txt'), 'committed work');
+    await run('git', ['-C', f.prepared.cwd, 'add', 'source.txt']);
+    await run('git', ['-C', f.prepared.cwd, 'commit', '-m', 'legitimate worker commit']);
+    const head = (await run('git', ['-C', f.prepared.cwd, 'rev-parse', 'HEAD'])).stdout.trim();
+    expect(head).not.toBe(f.prepared.baseCommit);
+    await writeFile(join(f.prepared.cwd, 'source.txt'), 'further edits');
+    const reopened = new LocalEnvironmentBroker({ ...f.configuration, repository: alias });
+    expect(await reopened.prepare(f.prepare)).toEqual(f.prepared);
+    expect(await reopened.execute(f.request('alias-read', { kind: 'read', path: 'source.txt' }))).toMatchObject({ status: 'completed', result: { text: 'further edits' } });
+    expect((await run('git', ['-C', f.prepared.cwd, 'rev-parse', 'HEAD'])).stdout.trim()).toBe(head);
+    expect(await readFile(join(f.repository, 'source.txt'), 'utf8')).toBe('original');
+  });
+});
+
+it('quarantines a native Job when live group termination cannot be established', async () => {
+  const f = await jobRuntime(undefined, f => `(trap '' TERM; printf begun > '${join(f.root, 'begun')}'; while [ ! -f '${join(f.root, 'finish')}' ]; do /bin/sleep 0.02; done; printf uncertain > '${join(f.root, 'uncertain-effect')}') & wait`);
+  await until(async () => readFile(join(f.root, 'begun'), 'utf8').then(x => x === 'begun', () => false));
+  await until(async () => (await f.r.list<any>('deliveryRun'))[0]?.settled === true);
+  const ticket = await f.r.readTicket<any>(f.ticket.id), job = (await f.r.list<any>('job'))[0];
+  const originalPath = process.env.PATH;
+  const noTools = join(f.root, 'no-inspection-tools'); await mkdir(noTools);
+  try {
+    // Real OS failure: ps cannot be launched, while the same-group child is alive.
+    process.env.PATH = noTools;
+    expect(await f.r.agents!.jobs.stop(ticket.workerConversationId, job.id)).toMatchObject({ status: 'unknown', receipt: { status: 'unknown' } });
+  } finally { process.env.PATH = originalPath; }
+  await f.r.agents!.waitForIdle();
+  expect((await f.r.list<any>('reservation')).find(x => x.ticketId === ticket.id)?.status).toBe('quarantined');
+  // The unknown receipt promises no rollback or cessation of possible effects.
+  await writeFile(join(f.root, 'finish'), 'finish uncertain child');
+  await until(async () => readFile(join(f.root, 'uncertain-effect'), 'utf8').then(x => x === 'uncertain', () => false));
+  expect((await f.r.list<any>('job'))[0].status).toBe('unknown');
+});
+
+it('verifies legacy prepared descriptors against the canonical repository without rewriting them', async () => {
+  const { digest, canonicalJson } = await import('../src/domain/model.js');
+  const f = await repo(), other = await repo();
+  const receipt: any = { ...f.prepared }; delete receipt.repository; delete receipt.gitCommonDirectory;
+  const descriptorPath = join(f.configuration.directory, 'environments', `${receipt.environmentId}.json`);
+  const markerPath = join(receipt.cwd, '.super-agent-environment.json');
+  await writeFile(descriptorPath, canonicalJson(receipt)); await writeFile(markerPath, canonicalJson(receipt));
+  const ledgerPath = join(f.configuration.directory, 'operations', `${digest('prepare')}.json`);
+  const ledger = { request: f.prepare, receipt };
+  await writeFile(ledgerPath, canonicalJson({ ...ledger, checksum: digest(ledger) }));
+  const reopened = new LocalEnvironmentBroker(f.configuration);
+  expect(await reopened.prepare(f.prepare)).toEqual(receipt);
+  expect(await reopened.execute(f.request('legacy-read', { kind: 'read', path: 'source.txt' }))).toMatchObject({ status: 'completed', result: { text: 'original' } });
+  const wrong = new LocalEnvironmentBroker({ ...f.configuration, repository: other.repository });
+  await expect(wrong.prepare(f.prepare)).rejects.toThrow(/repository/);
+  await expect(wrong.execute(f.request('legacy-wrong-read', { kind: 'read', path: 'source.txt' }))).rejects.toThrow(/repository/);
+  expect(await readFile(descriptorPath, 'utf8')).toBe(canonicalJson(receipt));
+  expect(await readFile(markerPath, 'utf8')).toBe(canonicalJson(receipt));
 });

@@ -14,7 +14,11 @@ export type PrepareRequest = OperationRequest<PreparePayload>;
 export type ExecuteRequest = OperationRequest<ExecutionPayload>;
 export function operationDigest(identity: EndpointIdentity, payload: unknown): string { return digest({ identity, payload }); }
 export interface ReceiptIdentity { operationId: string; payloadDigest: string; identity: EndpointIdentity }
-export interface PreparedReceipt extends ReceiptIdentity { status: 'prepared'; environmentId: string; cwd: string; baseCommit: string }
+export interface PreparedReceipt extends ReceiptIdentity {
+  status: 'prepared'; environmentId: string; cwd: string; baseCommit: string;
+  /** Present on new receipts; legacy receipts are verified through their environment hash and real git state. */
+  repository?: string; gitCommonDirectory?: string;
+}
 export type ExecutionResult = { text: string; truncated: boolean } | { bytes: number } |
   { stdout: string; stderr: string; truncated: boolean; exitCode: number | null; signal: string | null };
 export type ExecutionReceipt = ReceiptIdentity & (

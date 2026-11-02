@@ -4,14 +4,15 @@ import { mkdir, readFile, realpath, lstat, open, rename, unlink, link, readdir }
 import { join, resolve, relative, dirname, isAbsolute, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import { digest, canonicalJson } from '../domain/model.js';
-import { operationDigest, type EndpointAuthorizer, type EndpointIdentity, type EnvironmentBroker, type PrepareRequest, type PreparedReceipt, type ExecuteRequest, type ExecutionReceipt, type BrokerReceipt, type LifecycleReceipt, type ReceiptIdentity, type EndpointAction } from './types.js';
+import { operationDigest, type EndpointAuthorizer, type EndpointIdentity, type EnvironmentBroker, type PrepareRequest, type PreparedReceipt, type PreparationReceipt, type ExecuteRequest, type ExecutionReceipt, type BrokerReceipt, type LifecycleReceipt, type ReceiptIdentity, type EndpointAction } from './types.js';
 const git = promisify(execFile);
 const OUTPUT_LIMIT = 16384;
 const FILE_LIMIT = 1024 * 1024;
 const MARKER = '.super-agent-environment.json';
 interface Ledger { request: PrepareRequest | ExecuteRequest | { operationId: string; payloadDigest: string; identity: EndpointIdentity; payload: unknown }; receipt: BrokerReceipt }
-interface Active { request: ExecuteRequest; promise: Promise<ExecutionReceipt>; child?: ChildProcess; cancelling: boolean }
+interface Active { request: ExecuteRequest; promise: Promise<ExecutionReceipt>; child?: ChildProcess; cancelling: boolean; termination?: Promise<boolean>; unknown?: () => void }
 const active = new Map<string, Active>();
 const locks = new Map<string, Promise<unknown>>();
 const releasing = new Set<string>();
@@ -83,18 +84,22 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
     const identity = this.identity(request);
     await this.authorize(request.identity, 'prepare', 'repo.read');
     return this.serial(this.file(request.operationId), async () => {
+      const repository = await realpath(this.options.repository);
+      const gitCommonDirectory = await this.commonDirectory(repository);
+      const environmentId = digest({ identity: request.identity, repository });
       let previous = await this.read(request.operationId);
       if (previous) {
         this.conflict(previous, request);
         if (previous.receipt.status === 'prepared') { await this.environment(previous.receipt.environmentId, request.identity); return previous.receipt; }
+        const checkpoint = previous.receipt as PreparationReceipt;
+        if (checkpoint.environmentId !== environmentId || (checkpoint.repository !== undefined && checkpoint.repository !== repository) || (checkpoint.gitCommonDirectory !== undefined && checkpoint.gitCommonDirectory !== gitCommonDirectory)) throw new Error('Prepared repository identity conflict');
         // Preparation can safely inspect its deterministic marker/git state below.
       }
-      const repository = await realpath(this.options.repository);
-      const environmentId = digest({ identity: request.identity, repository });
       const cwd = join(this.directory, 'worktrees', environmentId);
-      const admitted = previous?.receipt as PreparedReceipt | undefined;
+      const admitted = previous?.receipt as PreparationReceipt | undefined;
       const baseCommit = admitted?.baseCommit ?? (await git('git', ['-C', repository, 'rev-parse', '--verify', `${request.payload.baseCommit ?? 'HEAD'}^{commit}`])).stdout.trim();
-      const receipt: PreparedReceipt = { ...identity, status: 'prepared', environmentId, cwd, baseCommit };
+      const legacy = previous && admitted?.repository === undefined && admitted?.gitCommonDirectory === undefined;
+      const receipt: PreparedReceipt = { ...identity, status: 'prepared', environmentId, cwd, baseCommit, ...(!legacy ? { repository, gitCommonDirectory } : {}) };
       if (!previous) {
         const won = await this.atomic(this.file(request.operationId), { request, receipt: { ...receipt, status: 'unknown', reason: 'Preparation admitted' } }, true);
         if (!won) { previous = (await this.read(request.operationId))!; this.conflict(previous, request); throw new Error('Concurrent preparation requires query/retry'); }
@@ -127,17 +132,30 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
     const listing = (await git('git', ['-C', repository, 'worktree', 'list', '--porcelain', '-z'])).stdout;
     const registration = listing.split('\0\0').map(block => block.split('\0')).find(fields => fields[0] === `worktree ${cwd}`);
     if (!registration?.includes(`HEAD ${baseCommit}`) || !registration.includes('detached')) throw new Error('Unknown or changed registered worktree');
-    const common = async (path: string) => realpath(resolve(path, (await git('git', ['-C', path, 'rev-parse', '--git-common-dir'])).stdout.trim()));
-    if (await common(repository) !== await common(cwd) || (await git('git', ['-C', cwd, 'rev-parse', 'HEAD'])).stdout.trim() !== baseCommit || await realpath((await git('git', ['-C', cwd, 'rev-parse', '--show-toplevel'])).stdout.trim()) !== cwd) throw new Error('Worktree repository/base conflict');
+    if (await this.commonDirectory(repository) !== await this.commonDirectory(cwd) || (await git('git', ['-C', cwd, 'rev-parse', 'HEAD'])).stdout.trim() !== baseCommit || await realpath((await git('git', ['-C', cwd, 'rev-parse', '--show-toplevel'])).stdout.trim()) !== cwd) throw new Error('Worktree repository/base conflict');
+  }
+  private async commonDirectory(repository: string): Promise<string> {
+    return realpath(resolve(repository, (await git('git', ['-C', repository, 'rev-parse', '--git-common-dir'])).stdout.trim()));
   }
   private async environment(environmentId: string, identity: EndpointIdentity): Promise<PreparedReceipt> {
     if (!/^[a-f0-9]{64}$/.test(environmentId)) throw new Error('Unknown environment');
     const descriptor = JSON.parse(await readFile(join(this.directory, 'environments', `${environmentId}.json`), 'utf8')) as PreparedReceipt;
+    const repository = await realpath(this.options.repository);
+    const gitCommonDirectory = await this.commonDirectory(repository);
+    if (descriptor.environmentId !== environmentId || digest({ identity, repository }) !== environmentId ||
+      (descriptor.repository !== undefined && descriptor.repository !== repository) ||
+      (descriptor.gitCommonDirectory !== undefined && descriptor.gitCommonDirectory !== gitCommonDirectory)) throw new Error('Prepared repository identity conflict');
     if (canonicalJson(descriptor.identity) !== canonicalJson(identity)) throw new Error('Unrelated environment identity');
     const cwd = await realpath(descriptor.cwd);
     if (cwd !== descriptor.cwd || cwd !== join(this.directory, 'worktrees', environmentId)) throw new Error('Environment path escape');
     const marker = JSON.parse(await readFile(join(cwd, MARKER), 'utf8'));
     if (canonicalJson(marker) !== canonicalJson(descriptor)) throw new Error('Environment marker conflict');
+    // Normal reuse allows user commits/branches and uncommitted edits. Bind the
+    // actual repository and top level, without requiring current HEAD == base.
+    if (await this.commonDirectory(cwd) !== gitCommonDirectory ||
+      await realpath((await git('git', ['-C', cwd, 'rev-parse', '--show-toplevel'])).stdout.trim()) !== cwd) throw new Error('Prepared repository identity conflict');
+    const listing = (await git('git', ['-C', repository, 'worktree', 'list', '--porcelain', '-z'])).stdout;
+    if (!listing.split('\0\0').some(block => block.split('\0')[0] === `worktree ${cwd}`)) throw new Error('Prepared repository registration conflict');
     return descriptor;
   }
   private async path(cwd: string, path: string): Promise<string> {
@@ -239,6 +257,7 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
           receipt = { ...identity, status: 'completed', result: { bytes: Buffer.byteLength(text) } };
         }
       } catch (error) { receipt = { ...identity, status: 'failed', reason: error instanceof Error ? error.message : String(error) }; }
+      if (state.cancelling && state.child?.pid && !(await this.terminateGroup(state))) receipt = { ...identity, status: 'unknown', reason: 'Process group termination could not be established' };
       await this.serial(key, () => this.atomic(key, { request, receipt }));
       return receipt;
     })();
@@ -248,18 +267,81 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
     const p = request.payload; if (p.kind !== 'shell') throw new Error('Expected shell');
     return new Promise(resolveReceipt => {
       const child = spawn('/bin/sh', ['-c', p.command], { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' }); state.child = child;
+      state.unknown = () => {
+        // An uncertain descendant may retain inherited pipe FDs indefinitely.
+        // Return the payload-bound unknown receipt independently of close and
+        // release only the host's observation resources, never claim cessation.
+        child.stdout?.destroy(); child.stderr?.destroy(); child.unref();
+        resolveReceipt({ ...identity, status: 'unknown', reason: 'Process group termination could not be established' });
+      };
       const chunks = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }; let truncated = false;
       for (const name of ['stdout', 'stderr'] as const) child[name]!.on('data', (chunk: Buffer) => {
         const available = OUTPUT_LIMIT - chunks[name].length; if (chunk.length > available) truncated = true;
         if (available > 0) chunks[name] = Buffer.concat([chunks[name], chunk.subarray(0, available)]);
       });
       child.once('error', error => resolveReceipt({ ...identity, status: 'failed', reason: error.message }));
-      child.once('close', (exitCode, signal) => resolveReceipt({ ...identity,
-        // Process termination confirms cancellation of the observed group, never rollback of effects.
-        status: state.cancelling ? (signal || exitCode === 0 ? 'cancelled' : 'unknown') : exitCode === 0 ? 'completed' : 'failed',
-        result: { stdout: boundedText(chunks.stdout), stderr: boundedText(chunks.stderr), truncated, exitCode, signal },
-      }));
+      child.once('close', (exitCode, signal) => {
+        // A closed shell can leave live members of its original group behind.
+        // Keep the endpoint handle until independent group supervision finishes.
+        void (async () => {
+          const confirmed = state.cancelling ? await this.terminateGroup(state) : undefined;
+          resolveReceipt({ ...identity,
+            status: state.cancelling ? (confirmed ? 'cancelled' : 'unknown') : exitCode === 0 ? 'completed' : 'failed',
+            ...(state.cancelling && !confirmed ? { reason: 'Process group termination could not be established' } : {}),
+            result: { stdout: boundedText(chunks.stdout), stderr: boundedText(chunks.stderr), truncated, exitCode, signal },
+          });
+        })();
+      });
     });
+  }
+  private async groupState(pgid: number): Promise<'gone' | 'live' | 'unknown'> {
+    try { process.kill(-pgid, 0); }
+    catch (error: any) { return error.code === 'ESRCH' ? 'gone' : 'unknown'; }
+    try {
+      // kill(0) also sees orphan zombies on hosts whose PID 1 reaps slowly.
+      // Zombies cannot execute effects; otherwise require an absent group or
+      // a complete snapshot proving every remaining member is already a zombie.
+      const listing = (await git('ps', ['-A', '-o', 'pgid=,stat='], { timeout: 200, maxBuffer: 4 * 1024 * 1024 })).stdout;
+      const members = listing.split('\n').flatMap(line => {
+        const match = /^\s*(\d+)\s+(\S+)/.exec(line);
+        return match && Number(match[1]) === pgid ? [match[2]] : [];
+      });
+      if (members.length) return members.every(status => status.startsWith('Z')) ? 'gone' : 'live';
+      // A missing ps row alone is not confirmation of group disappearance.
+      try { process.kill(-pgid, 0); return 'unknown'; }
+      catch (error: any) { return error.code === 'ESRCH' ? 'gone' : 'unknown'; }
+    } catch { return 'unknown'; }
+  }
+  private terminateGroup(state: Active): Promise<boolean> {
+    if (state.termination) return state.termination;
+    state.termination = (async () => {
+      const pgid = state.child?.pid;
+      if (!pgid) return false;
+      if (process.platform === 'win32') { state.child!.kill('SIGTERM'); return false; }
+      const signal = (name: NodeJS.Signals): 'sent' | 'gone' | 'unknown' => {
+        try { process.kill(-pgid, name); return 'sent'; }
+        catch (error: any) { return error.code === 'ESRCH' ? 'gone' : 'unknown'; }
+      };
+      const wait = async (): Promise<'gone' | 'live' | 'unknown'> => {
+        const deadline = performance.now() + 500;
+        for (;;) {
+          const current = await this.groupState(pgid);
+          if (current === 'gone' || performance.now() >= deadline) return current;
+          await delay(20);
+        }
+      };
+      const term = signal('SIGTERM');
+      if (term !== 'sent') return term === 'gone';
+      const afterTerm = await wait();
+      if (afterTerm === 'gone') return true;
+      // Escalation survives shell close. Never schedule a signal after losing
+      // the short-lived group's identity or after this bounded supervision.
+      if (afterTerm === 'unknown') return false;
+      const kill = signal('SIGKILL');
+      if (kill !== 'sent') return kill === 'gone';
+      return await wait() === 'gone';
+    })().then(confirmed => { if (!confirmed) state.unknown?.(); return confirmed; });
+    return state.termination;
   }
   async query(operationId: string): Promise<BrokerReceipt | undefined> {
     await this.ready();
@@ -287,15 +369,13 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
     const state = active.get(this.file(operationId));
     if (state) {
       state.cancelling = true;
-      if (state.child?.pid) {
-        try { if (process.platform === 'win32') state.child.kill('SIGTERM'); else process.kill(-state.child.pid, 'SIGTERM'); }
-        catch (error: any) { if (error.code !== 'ESRCH') throw error; }
-        // Escalate for a group which ignores TERM. Timer is bounded to this live handle.
-        const timer = setTimeout(() => { if (active.get(this.file(operationId)) === state && state.child?.pid) try { if (process.platform === 'win32') state.child.kill('SIGKILL'); else process.kill(-state.child.pid, 'SIGKILL'); } catch {} }, 500);
-        timer.unref(); void state.promise.finally(() => clearTimeout(timer));
-      }
+      if (state.child?.pid) void this.terminateGroup(state);
     }
-    const receipt = state ? await state.promise : (await this.query(operationId)) as ExecutionReceipt;
+    let receipt = state ? await state.promise : (await this.query(operationId)) as ExecutionReceipt;
+    if (state?.termination && !(await state.termination)) {
+      receipt = { ...this.identity(state.request), status: 'unknown', reason: 'Process group termination could not be established' };
+      await this.serial(this.file(operationId), () => this.atomic(this.file(operationId), { request: state.request, receipt }));
+    }
     await this.atomic(this.file(cancellationId), { request: cancelRequest, receipt: { ...this.identity(cancelRequest), status: ['completed','failed','cancelled'].includes(receipt.status) ? 'cancelled' : 'unknown' } });
     return receipt;
   }
