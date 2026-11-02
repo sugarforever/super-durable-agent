@@ -469,3 +469,50 @@ it("does not consume replay state on backpressure and lets a refused delivery re
     await source.webhook(runtime, signedSecond.raw, signedSecond.headers),
   ).toMatchObject({ disposition: "stored" });
 });
+
+it("rejects concurrent source disable over HTTP without consuming replay or delivery state", async () => {
+  const f = await fixture();
+  const server = await startManagementServer(f.runtime, {
+    port: 0,
+    token: "management",
+    feishu: f.source,
+  });
+  cleanup.push(() => server.close());
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>((resolve) => (enter = resolve)),
+    gate = new Promise<void>((resolve) => (release = resolve));
+  const originalReceive = f.runtime.engine.receiveBatch.bind(f.runtime.engine);
+  f.runtime.engine.receiveBatch = async (...args) => {
+    enter();
+    await gate;
+    return originalReceive(...args);
+  };
+  const request = signed(event());
+  const response = fetch(server.address + "/webhooks/feishu", {
+    method: "POST",
+    headers: request.headers,
+    body: request.raw,
+  });
+  await entered;
+  await f.runtime.engine.configureSource({
+    id: "feishu",
+    kind: "feishu",
+    enabled: false,
+  });
+  release();
+  const rejected = await response;
+  expect(rejected.status).toBeGreaterThanOrEqual(400);
+  expect(await f.runtime.list("trigger")).toHaveLength(0);
+  expect(await f.runtime.list("feishuDelivery")).toHaveLength(0);
+  expect(await f.runtime.list("feishuReplay")).toHaveLength(0);
+  await f.source.configure(f.runtime);
+  f.runtime.engine.receiveBatch = originalReceive;
+  const retried = await fetch(server.address + "/webhooks/feishu", {
+    method: "POST",
+    headers: request.headers,
+    body: request.raw,
+  });
+  expect(retried.status).toBe(200);
+  expect(await f.runtime.list("trigger")).toHaveLength(1);
+  expect(await f.runtime.list("feishuDelivery")).toHaveLength(1);
+});

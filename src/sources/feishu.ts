@@ -409,7 +409,7 @@ export class FeishuSource implements SourceAdapter {
           hash,
         });
       },
-      { preserveCursor: true, filterDisabled: true },
+      { preserveCursor: true },
     );
     runtime.agents?.kick();
     return result;

@@ -1,6 +1,10 @@
 import { digest } from '../domain/model.js';
 export interface EndpointIdentity { ticketId: string; assignmentId: string; epoch: number; mandateId: string }
-export interface EndpointGrant extends EndpointIdentity { capabilities: string[] }
+export interface EndpointGrant extends EndpointIdentity {
+  capabilities: string[];
+  /** Trusted current controller cancellation authority only; never supplied by operation payloads. */
+  revokeEpoch?: true;
+}
 export type EndpointAction = 'prepare' | 'execute' | 'cancel' | 'release';
 /** Host/daemon authority lookup on every mutation. Never accept model-provided capability flags. */
 export type EndpointAuthorizer = (identity: EndpointIdentity, action: EndpointAction) => Promise<EndpointGrant>;

@@ -100,7 +100,7 @@ async function jobRuntime(cancellationHandler?: any, commandFor?: (fixture: any)
   }));
   r = await openSuperAgent({ directory, models, model, environment: { repository: f.repository, trustedLocalShell: true }, cancellationHandler });
   cleanups.push(async () => { await writeFile(join(f.root, 'finish'), 'done'); await r.agents?.waitForIdle(); await r.close(); });
-  return { ...f, r, ticket, faux, models, model, directory };
+  return { ...f, get r() { return r; }, ticket, faux, models, model, directory, async reopen(startPaused = false) { await r.close(); r = await openSuperAgent({ directory, startPaused, models, model, environment: { repository: f.repository, trustedLocalShell: true }, cancellationHandler }); } };
 }
 describe('native asynchronous Jobs', () => {
   it('starts from a real Worker tool, keeps capacity, accepts feedback, and delivers completion once', async () => {
@@ -257,18 +257,22 @@ describe('Job and broker authority fences', () => {
   it('never delivers a prior-epoch Job result note after explicit retry', async () => {
     const f = await jobRuntime();
     await until(async () => readFile(join(f.root, 'begun'), 'utf8').then(x => x === 'begun', () => false));
-    const oldKick = f.r.agents!.kick.bind(f.r.agents); f.r.agents!.kick = () => {};
+    // A no-op kick does not drain an already scheduled timer/pump. Close the
+    // coordinator before completing the Job so its real claim path is quiescent.
+    await f.r.agents!.close();
     await writeFile(join(f.root, 'finish'), 'done');
     await until(async () => (await f.r.list<any>('job'))[0]?.status === 'completed');
     const job = (await f.r.list<any>('job'))[0];
     expect((await f.r.list<any>('workerNote')).find(x => x.jobId === job.id)?.status).toBe('pending');
-    await f.r.stopTicket(f.ticket.id, alice, { commandId: 'stop-before-result' }); await f.r.agents!.waitForIdle();
+    await f.reopen(true);
+    expect((await f.r.list<any>('workerNote')).find(x => x.jobId === job.id)?.status).toBe('pending');
+    await f.r.stopTicket(f.ticket.id, alice, { commandId: 'stop-before-result' });
+    await f.r.activate(); await f.r.agents!.waitForIdle();
     await f.r.retryTicket(f.ticket.id, alice, { commandId: 'retry-before-result' });
     await f.r.agents!.pump(); await f.r.agents!.waitForIdle();
     expect((await f.r.list<any>('deliveryRun')).some(x => x.id === `job-result:${job.id}`)).toBe(false);
     const latest = await f.r.readTicket<any>(f.ticket.id);
     await expect(f.r.agents!.jobs.start(latest.workerConversationId, { assignmentId: f.ticket.assignmentId, epoch: 1, command: 'echo stale' }, 'stale-call')).rejects.toThrow(/Stale/);
-    f.r.agents!.kick = oldKick;
   });
 });
 

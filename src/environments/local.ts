@@ -72,7 +72,7 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
   }
   private async authorize(identity: EndpointIdentity, action: EndpointAction, capability?: string): Promise<void> {
     const grant = await this.options.authorize(identity, action);
-    const { capabilities, ...bound } = grant;
+    const { capabilities, revokeEpoch: _revokeEpoch, ...bound } = grant;
     if (canonicalJson(bound) !== canonicalJson(identity)) throw new Error('Stale endpoint grant');
     if (capability && !capabilities.includes(capability)) throw new Error(`Missing capability: ${capability}`);
   }

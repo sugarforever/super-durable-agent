@@ -262,6 +262,11 @@ describe("remote endpoint protocol", () => {
   });
   it("fences future same-epoch operations after cancellation and reconciles old completion", async () => {
     const f = await fixture();
+    f.daemonOptions.authorize = async (i) => ({
+      ...i,
+      capabilities,
+      revokeEpoch: true,
+    });
     const request = f.request("cancelled", {
       kind: "shell",
       command: "printf started > cancel-started; sleep 2",
@@ -383,7 +388,11 @@ it("rechecks the epoch fence after a delayed controller grant resolves", async (
       enter();
       await gate;
     }
-    return { ...i, capabilities };
+    return {
+      ...i,
+      capabilities,
+      ...(action === "cancel" ? { revokeEpoch: true as const } : {}),
+    };
   };
   const pending = f.broker.execute(
     f.request("grant-race", { kind: "write", path: "file", text: "unsafe" }),
@@ -605,3 +614,190 @@ it("fails closed when previously delivered controller state loses its pinned dae
     /identity|continuity/i,
   );
 });
+
+async function nativeRemote(mode: "http" | "poll") {
+  const { openSuperAgent } = await import("../src/runtime/open.js");
+  const { createModels } = await import("@earendil-works/pi-ai/models");
+  const { fauxProvider, fauxAssistantMessage, fauxToolCall } =
+    await import("@earendil-works/pi-ai/providers/faux");
+  const { accept, alice, isRouter, until } =
+    await import("./helpers/scheduling.js");
+  const f = await fixture(mode);
+  const directory = join(f.root, "native-runtime");
+  let r = await openSuperAgent({ directory });
+  await r.updatePolicy(
+    {
+      version: 1,
+      acceptMode: "auto",
+      allowedActors: ["alice"],
+      botActors: [],
+      explicitCapabilities: ["repo.read", "repo.write", "command.execute"],
+      rules: [],
+    },
+    alice,
+    { commandId: "policy" },
+  );
+  const accepted = await accept(r, "native-work");
+  await r.close();
+  const faux = fauxProvider(),
+    models = createModels();
+  models.setProvider(faux.provider);
+  let first = true,
+    release!: () => void;
+  const holdGeneration = new Promise<void>((resolve) => (release = resolve));
+  faux.setResponses(
+    Array.from({ length: 50 }, () => async (ctx: any) => {
+      if (isRouter(ctx)) return fauxAssistantMessage("No decision");
+      if (first) {
+        first = false;
+        return fauxAssistantMessage(
+          fauxToolCall("start_job", {
+            assignmentId: accepted.assignmentId,
+            epoch: 1,
+            command: `printf begun > '${join(f.root, "native-begun")}'; sleep 10`,
+          }),
+          { stopReason: "toolUse" },
+        );
+      }
+      await holdGeneration;
+      return fauxAssistantMessage("Available");
+    }),
+  );
+  r = await openSuperAgent({
+    directory,
+    startPaused: true,
+    models,
+    model: { provider: faux.getModel().provider, modelId: faux.getModel().id },
+    environment: { broker: f.broker },
+  });
+  cleanup.push(async () => {
+    release();
+    await r.close();
+  });
+  f.daemonOptions.authorize = (i, action) =>
+    r.agents!.jobs.authorize(i, action);
+  await r.activate();
+  await until(async () =>
+    readFile(join(f.root, "native-begun"), "utf8").then(
+      (value) => value === "begun",
+      () => false,
+    ),
+  );
+  const firstJob = (await r.list<any>("job"))[0],
+    ticket = await r.readTicket<any>(accepted.id),
+    jobs = r.agents!.jobs;
+  return { ...f, r, firstJob, ticket, jobs, release, until };
+}
+
+for (const mode of ["http", "poll"] as const) {
+  it(`${mode}: stopping one native Job preserves same-Assignment file access and another Job`, async () => {
+    const f = await nativeRemote(mode);
+    const { r, firstJob, ticket, jobs, until } = f;
+    expect(
+      (await jobs.stop(ticket.workerConversationId, firstJob.id)).status,
+    ).toBe("cancelled");
+    const bound = {
+      assignmentId: ticket.assignmentId,
+      epoch: ticket.assignmentEpoch,
+    };
+    expect(
+      await jobs.file(
+        ticket.workerConversationId,
+        { ...bound, kind: "write", path: "after-stop", text: "safe" },
+        "write-after-stop",
+      ),
+    ).toMatchObject({ status: "completed" });
+    expect(
+      await jobs.file(
+        ticket.workerConversationId,
+        { ...bound, kind: "read", path: "after-stop" },
+        "read-after-stop",
+      ),
+    ).toMatchObject({ status: "completed", result: { text: "safe" } });
+    const second = await jobs.start(
+      ticket.workerConversationId,
+      { ...bound, command: "printf next" },
+      "next-job",
+    );
+    await until(
+      async () =>
+        (await r.engine.store.read<any>("job", second.jobId))?.status ===
+        "completed",
+    );
+    expect(
+      await jobs.get(ticket.workerConversationId, second.jobId),
+    ).toMatchObject({
+      status: "completed",
+      epoch: ticket.assignmentEpoch,
+      receipt: { result: { stdout: "next" } },
+    });
+    expect((await r.readTicket<any>(ticket.id)).assignmentEpoch).toBe(
+      ticket.assignmentEpoch,
+    );
+    f.release();
+  });
+}
+
+for (const mode of ["http", "poll"] as const) {
+  it(`${mode}: actual Ticket stop derives epoch revocation and fences delayed/future admissions`, async () => {
+    const f = await nativeRemote(mode);
+    const { alice } = await import("./helpers/scheduling.js");
+    const original = f.daemonOptions.authorize;
+    let enter!: () => void,
+      release!: () => void,
+      calls = 0,
+      revokedGrant = false;
+    const entered = new Promise<void>((resolve) => (enter = resolve)),
+      gate = new Promise<void>((resolve) => (release = resolve));
+    f.daemonOptions.authorize = async (i, action) => {
+      const grant = await original(i, action);
+      if (action === "cancel" && grant.revokeEpoch === true)
+        revokedGrant = true;
+      if (action === "execute" && ++calls === 2) {
+        enter();
+        await gate;
+      }
+      return grant;
+    };
+    const payload = {
+      kind: "write" as const,
+      environmentId: f.firstJob.environmentId,
+      path: "must-not-write",
+      text: "unsafe",
+    };
+    const request = {
+      operationId: "delayed-ticket-stop",
+      identity: f.firstJob.identity,
+      payload,
+      payloadDigest: operationDigest(f.firstJob.identity, payload),
+    };
+    const delayed = f.broker.execute(request);
+    await entered;
+    f.release();
+    await f.r.stopTicket(f.ticket.id, alice, { commandId: "stop-ticket" });
+    await f.until(
+      async () =>
+        revokedGrant &&
+        (await f.r.engine.store.read<any>("job", f.firstJob.id))?.status ===
+          "cancelled",
+    );
+    release();
+    expect(await delayed).toMatchObject({
+      status: "failed",
+      reason: expect.stringMatching(/fenced|revoked/i),
+    });
+    await expect(
+      f.broker.execute({ ...request, operationId: "future-ticket-stop" }),
+    ).rejects.toThrow(/Stale|revoked/i);
+    const prepared = await f.broker.query(
+      `prepare:${f.firstJob.identity.ticketId}:${f.firstJob.identity.assignmentId}:${f.firstJob.identity.epoch}`,
+    );
+    expect(prepared?.status).toBe("prepared");
+    if (!prepared || !("cwd" in prepared))
+      throw new Error("Missing prepared receipt");
+    await expect(
+      readFile(join(prepared.cwd, "must-not-write")),
+    ).rejects.toThrow();
+    expect((await f.r.readTicket<any>(f.ticket.id)).lifecycle).toBe("stopped");
+  });
+}

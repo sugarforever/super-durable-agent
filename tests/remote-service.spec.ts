@@ -69,6 +69,19 @@ async function launch(
   expect(stdout + stderr).not.toContain("remote-secret");
   return { child, startup: JSON.parse(stdout.split("\n")[0]) };
 }
+async function waitForFile(path: string, expected: string) {
+  for (let i = 0; i < 1000; i++) {
+    if (
+      await readFile(path, "utf8").then(
+        (value) => value === expected,
+        () => false,
+      )
+    )
+      return;
+    await delay(5);
+  }
+  throw new Error("Expected observable daemon shell effect did not arrive");
+}
 async function stop(
   child: ChildProcessWithoutNullStreams,
   signal: NodeJS.Signals = "SIGTERM",
@@ -182,7 +195,7 @@ it("validates nested remote/Feishu settings and refuses inline credentials", asy
     else process.env.ENDPOINT_TOKEN = old;
   }
 });
-it("daemon CLI survives controller timeout/restart and reports interrupted ledger as unknown without rerunning a shell", async () => {
+it("daemon CLI preserves launched operation uncertainty across SIGKILL/restart without rerunning a shell", async () => {
   const directory = await root(),
     repository = join(directory, "repo");
   await mkdir(repository);
@@ -257,11 +270,11 @@ it("daemon CLI survives controller timeout/restart and reports interrupted ledge
       payload,
       payloadDigest: operationDigest(identity, payload),
     });
-  broker.options.timeoutMs = 100;
+  broker.options.timeoutMs = 3000;
   const command = {
     kind: "shell" as const,
     environmentId: prepared.environmentId,
-    command: "printf x >> count; sleep 0.5",
+    command: `printf x >> count; while [ ! -f '${join(directory, "release-shell")}' ]; do sleep 0.02; done; printf done > '${join(directory, "shell-finished")}'`,
   };
   const request = {
     operationId: "interrupted",
@@ -269,9 +282,13 @@ it("daemon CLI survives controller timeout/restart and reports interrupted ledge
     payload: command,
     payloadDigest: operationDigest(identity, command),
   };
-  expect(await broker.execute(request)).toMatchObject({ status: "unknown" });
+  cleanup.push(() => writeFile(join(directory, "release-shell"), "done"));
+  const execution = broker.execute(request);
+  await waitForFile(join(prepared.cwd, "count"), "x");
   await stop(daemon.child, "SIGKILL");
-  await delay(550);
+  expect(await execution).toMatchObject({ status: "unknown" });
+  await writeFile(join(directory, "release-shell"), "done");
+  await waitForFile(join(directory, "shell-finished"), "done");
   daemon = await launch("dist/daemon/cli.js", config);
   broker.options.url = daemon.startup.listening;
   const restarted = new RemoteEnvironmentBroker(broker.options);
@@ -452,7 +469,7 @@ it("poll reconnect queries a previously delivered shell even when its daemon adm
   const command = {
     kind: "shell" as const,
     environmentId: prepared.environmentId,
-    command: "printf x >> count; sleep 0.4",
+    command: `printf x >> count; while [ ! -f '${join(directory, "release-shell")}' ]; do sleep 0.02; done; printf done > '${join(directory, "shell-finished")}'`,
   };
   const request = {
     operationId: "lost-file",
@@ -460,9 +477,12 @@ it("poll reconnect queries a previously delivered shell even when its daemon adm
     payload: command,
     payloadDigest: operationDigest(identity, command),
   };
+  cleanup.push(() => writeFile(join(directory, "release-shell"), "done"));
   expect(await broker.execute(request)).toMatchObject({ status: "unknown" });
+  await waitForFile(join(prepared.cwd, "count"), "x");
   await stop(daemon.child, "SIGKILL");
-  await delay(450);
+  await writeFile(join(directory, "release-shell"), "done");
+  await waitForFile(join(directory, "shell-finished"), "done");
   await rm(
     join(
       directory,

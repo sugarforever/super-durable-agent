@@ -117,7 +117,7 @@ export class RemoteDaemon {
       identity.epoch <= latestFence.epoch
     )
       throw new Error("Endpoint epoch is fenced/revoked");
-    const { capabilities, ...bound } = grant;
+    const { capabilities, revokeEpoch, ...bound } = grant;
     if (
       canonicalJson(bound) !== canonicalJson(identity) ||
       !Array.isArray(capabilities)
@@ -125,6 +125,9 @@ export class RemoteDaemon {
       throw new Error("Stale controller grant identity");
     return {
       ...identity,
+      ...(action === "cancel" && revokeEpoch === true
+        ? { revokeEpoch: true as const }
+        : {}),
       capabilities: capabilities.filter((c) =>
         this.options.capabilities.includes(c),
       ),
@@ -171,14 +174,15 @@ export class RemoteDaemon {
       const original = await this.broker.query(target);
       if (!original || original.identity.epoch !== body.epoch)
         throw new ProtocolError(409, "Unknown operation or epoch conflict");
-      await this.authorize(original.identity, "cancel");
-      // Fence before awaiting process termination, including other concurrent admissions.
-      await this.fences.serial(original.identity.ticketId, async () => {
-        const previous = await this.fences.read(original.identity.ticketId);
-        await this.fences.write(original.identity.ticketId, {
-          epoch: Math.max(previous?.epoch ?? 0, body.epoch),
+      const grant = await this.authorize(original.identity, "cancel");
+      // Only trusted Ticket cancellation authority revokes the whole epoch. stop_job cancels one operation.
+      if (grant.revokeEpoch === true)
+        await this.fences.serial(original.identity.ticketId, async () => {
+          const previous = await this.fences.read(original.identity.ticketId);
+          await this.fences.write(original.identity.ticketId, {
+            epoch: Math.max(previous?.epoch ?? 0, body.epoch),
+          });
         });
-      });
       const receipt = await this.broker.cancel(target, body.epoch);
       return {
         ...receipt,

@@ -32,7 +32,7 @@ export class Jobs {
     const { store } = this.engine;
     if (action === 'cancel') {
       const cancellation = (await store.listInTransaction<CancelIntent>(tx, 'cancel')).some(x => x.ticketId === identity.ticketId && x.assignmentId === identity.assignmentId && x.epoch === identity.epoch);
-      if (cancellation) return { ...identity, capabilities: [] };
+      if (cancellation) return { ...identity, capabilities: [], revokeEpoch: true };
     }
     const ticket = await store.get<Ticket>(tx, 'ticket', identity.ticketId);
     const mandate = await store.get<Mandate>(tx, 'mandate', identity.mandateId);
