@@ -34,3 +34,10 @@ export async function fixture(count: number, options: Pick<OpenOptions, 'cancell
   r = await openSuperAgent({ directory, models, model, ...options });
   return { r, directory, tickets, calls, faux, models, model, release, async close() { release(); await this.r.close(); await rm(directory, { recursive: true, force: true }); } };
 }
+
+/** Node 22/24 SQLite emits this known warning. Preserve every other stderr line. */
+export function withoutSqliteExperimentalWarning(stderr: string): string {
+  return stderr
+    .replace(/^\(node:\d+\) ExperimentalWarning: SQLite is an experimental feature and might change at any time\r?\n/gm, '')
+    .replace(/^\(Use `node --trace-warnings \.\.\.` to show where the warning was created\)\r?\n/gm, '');
+}

@@ -214,3 +214,73 @@ describe('revocation during Report preparation', () => {
     f.release(); await f.r.agents!.waitForIdle();
   });
 });
+
+describe('monotonic cancellation checkpoints', () => {
+  it('does not reopen a repaired cancellation when a delayed native task returns unknown during the next generation', async () => {
+    let handlerEntered!: () => void, releaseHandler!: () => void;
+    const entered = new Promise<void>(resolve => handlerEntered = resolve), handlerGate = new Promise<void>(resolve => releaseHandler = resolve);
+    let request: any;
+    const f = await fixture(1, { cancellationHandler: async current => { request = current; handlerEntered(); await handlerGate; return { ...current, outcome: 'unknown' }; } }); fixtures.push(f);
+    let releaseNext!: () => void;
+    const nextGate = new Promise<void>(resolve => releaseNext = resolve);
+    try {
+      await until(async () => f.calls.length === 1);
+      const a = (await f.r.list<any>('ticket'))[0];
+      await f.r.stopTicket(a.id, alice, { commandId: 'delayed-stop' }); await f.r.agents!.pump(); f.release();
+      await entered;
+      const cancel = (await f.r.list<any>('cancel'))[0];
+      expect(cancel.nativeConfirmed).toBe(true);
+      await f.r.engine.transaction(tx => f.r.agents!.cancellation.receipt(tx, cancel.id, { ...request, outcome: 'confirmed' }));
+      const { fauxAssistantMessage } = await import('@earendil-works/pi-ai/providers/faux');
+      f.faux.setResponses([async (ctx: any, options: any) => { f.calls.push({ ctx, signal: options.signal }); await nextGate; return fauxAssistantMessage('new generation'); }]);
+      await f.r.retryTicket(a.id, alice, { commandId: 'delayed-retry' });
+      await until(async () => { await f.r.agents!.pump(); return f.calls.length === 2; });
+      const next = await f.r.readTicket<any>(a.id);
+      expect(next.workerConversationId).toBe(a.workerConversationId);
+      releaseHandler(); await f.r.harness.waitForTask(cancel.taskId, f.r.engine.context);
+      expect(await f.r.engine.store.read('cancel', cancel.id)).toMatchObject({ status: 'completed', nativeConfirmed: true, endpointConfirmed: true });
+      await f.r.agents!.pump();
+      expect(f.calls[1].signal.aborted).toBe(false);
+      expect((await f.r.list<any>('reservation')).filter(x => x.status !== 'released')).toMatchObject([{ epoch: next.assignmentEpoch, status: 'active' }]);
+    } finally { releaseHandler(); releaseNext(); f.release(); await f.r.agents!.waitForIdle(); }
+  });
+  it('uses confirmed native abort as a checkpoint while an endpoint retry is suspended and repaired', async () => {
+    let endpointEntered!: () => void, forbiddenAbort!: () => void, releaseEndpoint!: () => void, releaseAbort!: () => void, releaseNext!: () => void;
+    const endpoint = new Promise<'endpoint'>(resolve => endpointEntered = () => resolve('endpoint'));
+    const abort = new Promise<'native-abort'>(resolve => forbiddenAbort = () => resolve('native-abort'));
+    const endpointGate = new Promise<void>(resolve => releaseEndpoint = resolve), abortGate = new Promise<void>(resolve => releaseAbort = resolve), nextGate = new Promise<void>(resolve => releaseNext = resolve);
+    let attempts = 0, request: any;
+    const f = await fixture(1, { cancellationHandler: async current => { request = current; if (++attempts > 1) { endpointEntered(); await endpointGate; } return { ...current, outcome: 'unknown' }; } }); fixtures.push(f);
+    const cancellation = f.r.agents!.cancellation, original = cancellation.cancel.bind(cancellation);
+    // Wrap the actual invocation-bound native handle only to hold an attempted
+    // repeat abort. No native task/state/abort receipt is fabricated.
+    cancellation.cancel = async (intent, conversationId, context, runtime) => original(intent, conversationId, context, {
+      signal: runtime.signal,
+      waitForTask: runtime.waitForTask.bind(runtime),
+      conversation: async (id, ctx) => {
+        const handle = await runtime.conversation(id, ctx);
+        if (!handle || !intent.nativeConfirmed) return handle;
+        return { ...handle, submit: handle.submit.bind(handle), waitForIdle: handle.waitForIdle.bind(handle), abort: async (ctx, options) => { forbiddenAbort(); await abortGate; return handle.abort(ctx, options); } };
+      },
+    });
+    try {
+      await until(async () => f.calls.length === 1);
+      const a = (await f.r.list<any>('ticket'))[0];
+      await f.r.stopTicket(a.id, alice, { commandId: 'checkpoint-stop' }); f.release();
+      await until(async () => { await f.r.agents!.pump(); return attempts >= 1; });
+      await f.r.agents!.pump();
+      expect(await Promise.race([endpoint, abort])).toBe('endpoint');
+      const cancel = (await f.r.list<any>('cancel'))[0];
+      expect(cancel.attempts).toBe(2); expect(cancel.nativeConfirmed).toBe(true);
+      await f.r.engine.transaction(tx => cancellation.receipt(tx, cancel.id, { ...request, outcome: 'confirmed' }));
+      const { fauxAssistantMessage } = await import('@earendil-works/pi-ai/providers/faux');
+      f.faux.setResponses([async (ctx: any, options: any) => { f.calls.push({ ctx, signal: options.signal }); await nextGate; return fauxAssistantMessage('new assignment'); }]);
+      await f.r.retryTicket(a.id, alice, { commandId: 'checkpoint-retry' });
+      await until(async () => { await f.r.agents!.pump(); return f.calls.length === 2; });
+      releaseAbort(); releaseEndpoint(); await f.r.harness.waitForTask(cancel.taskId, f.r.engine.context);
+      await f.r.agents!.pump();
+      expect(f.calls[1].signal.aborted).toBe(false);
+      expect(await f.r.engine.store.read('cancel', cancel.id)).toMatchObject({ status: 'completed', nativeConfirmed: true, endpointConfirmed: true });
+    } finally { releaseAbort(); releaseEndpoint(); releaseNext(); f.release(); await f.r.agents!.waitForIdle(); }
+  });
+});

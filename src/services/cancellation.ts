@@ -21,30 +21,43 @@ export class Cancellation {
   async cancel(intent: CancelIntent, conversationId: ConversationId | undefined, context: Context, runtime: CancelRuntime): Promise<CancellationReceipt> {
     runtime.signal.throwIfAborted();
     const request = this.request(intent);
-    const taskIds = await this.engine.transaction(async tx => {
+    const plan = await this.engine.transaction(async tx => {
       const current = await this.engine.store.get<CancelIntent>(tx, 'cancel', intent.id);
       if (!current || current.taskId !== intent.taskId || current.status !== 'pending') throw new Error('Stale cancellation claim');
+      // This is a completed, one-way checkpoint. Endpoint-only retries must never
+      // abort the reused Worker conversation, even if the phase's snapshot is old.
+      if (current.nativeConfirmed) return { nativeConfirmed: true, taskIds: [] };
       const tasks = await nativeTasks(tx);
       const runs = await this.engine.store.listInTransaction<AgentRun>(tx, 'deliveryRun');
       const redrives = await this.engine.store.listInTransaction<{ taskId?: number; input?: { runId: string } }>(tx, 'redrive');
       const jobs = await this.engine.store.listInTransaction<ExecutionAccounting & { taskId?: number }>(tx, 'job');
       const owned = runs.filter(x => x.ticketId === intent.ticketId && x.epoch === intent.epoch);
       const ids = new Set<number | undefined>([...owned.map(x => x.taskId), ...redrives.filter(x => owned.some(run => run.id === x.input?.runId)).map(x => x.taskId), ...jobs.filter(x => x.ticketId === intent.ticketId && x.epoch === intent.epoch).map(x => x.taskId)]);
-      return tasks.filter(x => ids.has(x.id)).map(x => x.id);
+      return { nativeConfirmed: false, taskIds: tasks.filter(x => ids.has(x.id)).map(x => x.id) };
     });
-    // Mark only THIS Ticket's Control children. Router and unrelated Workers keep running.
-    runtime.signal.throwIfAborted();
-    await Promise.all(taskIds.map(id => this.engine.harness.abortTask(id, context)));
-    if (conversationId !== undefined) {
-      const conversation = await runtime.conversation(conversationId, context);
-      await conversation?.abort(context, { background: true });
+    if (!plan.nativeConfirmed) {
+      // Until this invocation finishes its native abort and persists confirmation,
+      // endpoint receipt repair cannot complete/release the old epoch. After that
+      // checkpoint no invocation may issue a conversation-wide abort for it again.
+      runtime.signal.throwIfAborted();
+      await Promise.all(plan.taskIds.map(id => this.engine.harness.abortTask(id, context)));
+      if (conversationId !== undefined) {
+        const conversation = await runtime.conversation(conversationId, context);
+        await conversation?.abort(context, { background: true });
+      }
+      await Promise.all(plan.taskIds.map(id => runtime.waitForTask(id, context)));
+      await this.engine.transaction(async tx => {
+        const current = await this.engine.store.get<CancelIntent>(tx, 'cancel', intent.id);
+        if (current && current.taskId === intent.taskId) await this.engine.store.put(tx, 'cancel', intent.id, {
+          ...current, nativeConfirmed: true,
+          status: current.endpointConfirmed || current.status === 'completed' ? 'completed' : current.status,
+        });
+      });
     }
-    await Promise.all(taskIds.map(id => runtime.waitForTask(id, context)));
-    await this.engine.transaction(async tx => {
-      const current = await this.engine.store.get<CancelIntent>(tx, 'cancel', intent.id);
-      if (current?.taskId === intent.taskId) await this.engine.store.put(tx, 'cancel', intent.id, { ...current, nativeConfirmed: true });
-    });
     runtime.signal.throwIfAborted();
+    const current = await this.engine.store.read<CancelIntent>('cancel', intent.id);
+    if (!current || current.taskId !== intent.taskId) throw new Error('Stale cancellation claim');
+    if (current.endpointConfirmed || current.status === 'completed') return { ...request, outcome: 'confirmed' };
     if (this.handler) return this.handler(request, context);
     const jobs = await this.engine.store.list<ExecutionAccounting>('job');
     const unknown = jobs.some(x => x.ticketId === intent.ticketId && x.epoch === intent.epoch && !['completed','cancelled','failed'].includes(x.status));
@@ -57,8 +70,14 @@ export class Cancellation {
     if (!intent || (taskId !== undefined && intent.taskId !== taskId)) return;
     const request = this.request(intent);
     if (request.cancelKey !== receipt.cancelKey || request.payloadDigest !== receipt.payloadDigest) throw new Error('Cancel receipt identity conflict');
-    const endpointConfirmed = receipt.outcome === 'confirmed';
-    await store.put(tx, 'cancel', intentId, { ...intent, endpointConfirmed, status: endpointConfirmed && intent.nativeConfirmed ? 'completed' : 'pending' });
+    // Confirmed facts and completion are monotonic, including legacy completed
+    // intents. A delayed unknown response cannot reopen cancellation or its budget.
+    const endpointConfirmed = intent.endpointConfirmed === true || intent.status === 'completed' || receipt.outcome === 'confirmed';
+    const nativeConfirmed = intent.nativeConfirmed === true || intent.status === 'completed';
+    await store.put(tx, 'cancel', intentId, {
+      ...intent, endpointConfirmed, nativeConfirmed,
+      status: endpointConfirmed && nativeConfirmed ? 'completed' : intent.status,
+    });
     if (endpointConfirmed) {
       for (const job of await store.listInTransaction<ExecutionAccounting>(tx, 'job'))
         if (job.ticketId === intent.ticketId && job.epoch === intent.epoch && !['completed','cancelled','failed'].includes(job.status))

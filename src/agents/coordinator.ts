@@ -552,6 +552,9 @@ export class AgentCoordinator {
     await this.reconcileAuxiliary();
     await this.claimRouterBatch();
     await this.recoverQueued();
+    // Auxiliary reconciliation can establish completion or exhaust cancellation
+    // after the initial accounting pass. Publish that occupancy before returning.
+    await reconcile(this.engine);
   }
   private async reconcileAuxiliary(): Promise<void> {
     const { store } = this.engine;
@@ -1532,7 +1535,7 @@ export class AgentCoordinator {
         ];
         const auxiliary = [
           ...(await this.engine.store.list<CancelIntent>("cancel")),
-          ...(await this.engine.store.list<{ taskId?: TaskId<null> }>("redrive")),
+          ...(await this.engine.store.list<{ taskId?: TaskId<null>; status?: string }>("redrive")),
         ];
         let auxiliaryLive = false;
         for (const claim of auxiliary) {
@@ -1540,7 +1543,7 @@ export class AgentCoordinator {
           const task = await this.engine.harness.getTask(claim.taskId, this.engine.context);
           if (task && task.state.status !== "terminal") auxiliaryLive = true;
         }
-        if (!auxiliaryLive && !again.some((r) => r.status === "pending" || r.status === "submitted")) break;
+        if (!auxiliaryLive && !auxiliary.some(claim => claim.status === "pending") && !again.some((r) => r.status === "pending" || r.status === "submitted")) break;
       } else
         await Promise.all(
           live.map((id) =>

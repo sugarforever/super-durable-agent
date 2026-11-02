@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { fauxAssistantMessage } from '@earendil-works/pi-ai/providers/faux';
-import { fixture, accept, until, event, isRouter } from './helpers/scheduling.js';
+import { fixture, accept, until, event, isRouter, withoutSqliteExperimentalWarning } from './helpers/scheduling.js';
 const fixtures: Awaited<ReturnType<typeof fixture>>[] = [];
 afterEach(async () => { for (const f of fixtures.splice(0)) await f.close(); });
 describe('durable domain capacity', () => {
@@ -115,7 +115,7 @@ describe('restart reservations', () => {
     let stderr = ''; child.stderr.on('data', v => stderr += v);
     try {
       const [code, signal] = await once(child, 'exit');
-      expect({ code, signal, stderr }).toEqual({ code: null, signal: 'SIGKILL', stderr: '' });
+      expect({ code, signal, stderr: withoutSqliteExperimentalWarning(stderr) }).toEqual({ code: null, signal: 'SIGKILL', stderr: '' });
       const faux = fauxProvider(), models = createModels(); models.setProvider(faux.provider);
       let started = 0;
       faux.setResponses(Array.from({ length: 30 }, () => async () => { started++; await gate; return fauxAssistantMessage('Recovered'); }));
@@ -157,5 +157,60 @@ describe('trusted delivery replay helper', () => {
       expect(await f.r.engine.transaction(tx => tx.submissionByRequest(run.conversationId, run.requestId))).toBeUndefined();
     } finally { release(); f.release(); await f.r.agents!.waitForIdle(); }
     expect(await f.r.agents!.submitDelivery(run.id)).toBe((await f.r.engine.store.read<any>('deliveryRun', run.id)).submissionId);
+  });
+});
+
+
+describe('pre-admission native recovery', () => {
+  it('reconstructs a missing reservation for the live Control input before resume after SIGKILL', async () => {
+    const { mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os'); const { join } = await import('node:path');
+    const { spawn } = await import('node:child_process'); const { once } = await import('node:events');
+    const { createModels } = await import('@earendil-works/pi-ai/models');
+    const { fauxProvider, fauxToolCall } = await import('@earendil-works/pi-ai/providers/faux');
+    const { openSuperAgent } = await import('../src/runtime/open.js');
+    const directory = await mkdtemp(join(tmpdir(), 'sa-admission-reservation-'));
+    const child = spawn(process.execPath, ['tests/helpers/scheduling-crash.mjs', directory, 'preadmission'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '', runtime: Awaited<ReturnType<typeof openSuperAgent>> | undefined;
+    let original: any, worker: any, reports = 0;
+    child.stderr.on('data', value => stderr += value);
+    try {
+      const [code, signal] = await once(child, 'exit');
+      expect({ code, signal, stderr: withoutSqliteExperimentalWarning(stderr) }).toEqual({ code: null, signal: 'SIGKILL', stderr: '' });
+      const faux = fauxProvider(), models = createModels(); models.setProvider(faux.provider);
+      faux.setResponses([
+        async (ctx: any) => {
+          reports++;
+          const user = ctx.messages.filter((m: any) => m.role === 'user').at(-1);
+          const input = JSON.parse(typeof user.content === 'string' ? user.content : user.content[0].text);
+          return fauxAssistantMessage(fauxToolCall('report', { reportId: 'recovered-admission', assignmentId: input.assignmentId, epoch: input.epoch, inputIds: [input.inputId], status: 'ready', content: {} }), { stopReason: 'toolUse' });
+        },
+        fauxAssistantMessage('Recovered once'),
+      ]);
+      runtime = await openSuperAgent({ directory, models, model: { provider: faux.getModel().provider, modelId: faux.getModel().id }, preflight: async engine => {
+        original = (await engine.store.list<any>('deliveryRun'))[0];
+        expect(original.status).toBe('pending'); expect(original.admitted).toBe(false);
+        expect(await engine.transaction(tx => tx.submissionByRequest(original.conversationId, original.requestId))).toBeUndefined();
+        const controlTask = await engine.harness.getTask(original.taskId, engine.context);
+        expect(controlTask).toMatchObject({ kind: 'sa.agentInput', conversationId: engine.control.id });
+        expect(controlTask?.state.status).not.toBe('terminal');
+        worker = (await engine.store.list<any>('ticket'))[0];
+        expect((await engine.transaction(tx => tx.scanTasks({ conversationId: worker.workerConversationId, kind: 'pi.generation' }, 10))).items).toHaveLength(0);
+        await engine.transaction(async tx => {
+          for (const reservation of await engine.store.listInTransaction<any>(tx, 'reservation'))
+            await engine.store.put(tx, 'reservation', reservation.id, { ...reservation, status: 'released' });
+        });
+      } });
+      await runtime.agents!.waitForIdle();
+      expect(reports).toBe(1);
+      const runs = await runtime.list<any>('deliveryRun');
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ id: original.id, requestId: original.requestId, promptDigest: original.promptDigest, taskId: original.taskId, consumed: true, settled: true });
+      // pi uses one generation for the tool call and another for the final reply.
+      expect((await runtime.engine.transaction(tx => tx.scanTasks({ conversationId: worker.workerConversationId, kind: 'pi.generation' }, 10))).items).toHaveLength(2);
+      const native = await runtime.engine.transaction(tx => tx.submissionByRequest(original.conversationId, original.requestId));
+      expect(native?.id).toBe(runs[0].submissionId); expect(native?.entry).toBeDefined();
+      expect((await runtime.readTicket<any>(worker.id)).latestReport.status).toBe('ready');
+    } finally { await runtime?.close(); await rm(directory, { recursive: true, force: true }); }
   });
 });
