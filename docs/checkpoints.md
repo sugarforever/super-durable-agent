@@ -8,7 +8,7 @@ Each row corresponds to one requirement issue and one incremental PR. A PR targe
 | 2 | Persistent domain kernel and single-writer runtime | [#2](https://github.com/sugarforever/super-durable-agent/issues/2) | [#12](https://github.com/sugarforever/super-durable-agent/pull/12) | `codex/01-design-baseline` | Implemented; user approval pending |
 | 3 | Authorization and subscription ownership | [#3](https://github.com/sugarforever/super-durable-agent/issues/3) | [#13](https://github.com/sugarforever/super-durable-agent/pull/13) | `codex/02-domain-kernel` | Implemented; user approval pending |
 | 4 | Router and Worker conversations with durable delivery | [#4](https://github.com/sugarforever/super-durable-agent/issues/4) | [#14](https://github.com/sugarforever/super-durable-agent/pull/14) | `codex/03-policy-ownership` | Implemented; user approval pending |
-| 5 | Capacity scheduling and cancellation fencing | [#5](https://github.com/sugarforever/super-durable-agent/issues/5) | Pending | `codex/04-agent-conversations` | Planned |
+| 5 | Capacity scheduling and cancellation fencing | [#5](https://github.com/sugarforever/super-durable-agent/issues/5) | [#15](https://github.com/sugarforever/super-durable-agent/pull/15) | `codex/04-agent-conversations` | Implemented; user approval pending |
 | 6 | Local environments and asynchronous jobs | [#6](https://github.com/sugarforever/super-durable-agent/issues/6) | Pending | `codex/05-scheduling-cancellation` | Planned |
 | 7 | Transactional Outbox and external effect recovery | [#7](https://github.com/sugarforever/super-durable-agent/issues/7) | Pending | `codex/06-environments-jobs` | Planned |
 | 8 | CLI, GitHub integration and management API | [#8](https://github.com/sugarforever/super-durable-agent/issues/8) | Pending | `codex/07-outbox` | Planned |
@@ -63,3 +63,7 @@ Implementation commit `242759c`. 57 real SQLite tests pass (19 kernel, 17 policy
 ## Part 4 evidence
 
 Implementation commit `f61dacd`. 92 tests pass across five files, including 34 native conversation cases and interrupted/concurrent artifact publication. Typecheck/build, seven pi probes, and seven English-document checks pass. One scoped correction round resolved all six findings: retry claim fencing, ownership transition delivery, trusted authority discovery, atomic artifacts, upgrade replay, and terminal auxiliary recovery. CI passes Node22.19 and24. No real provider or external-account trial was executed. Independent scoped specification/quality review completed with important findings resolved. User approval and merge remain pending.
+
+## Part 5 evidence
+
+Implementation commit `996c7c9`. 111 tests across seven files pass, plus typecheck/build, seven pi probes and English-document checks. Scoped correction review resolved cancellation monotonicity, endpoint-only retry fencing, and pre-admission reservation recovery, with native barrier and SIGKILL regressions. No real broker, provider, or external-account trial was executed. Independent scoped specification/quality review completed with important findings resolved. User approval and merge remain pending.
