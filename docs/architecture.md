@@ -127,7 +127,7 @@ Models propose structured accept/attach/ignore/stop decisions. Engine rechecks c
 
 Policy changes invalidate unfinished Eval epochs and enqueue reevaluation; late results are rejected. Notify affected active Tickets without replacing their Mandate through ordinary context. Revalidate ended work before resumption. Explicit stop immediately withdraws authority. Endpoint access revocation is also immediate.
 
-Capabilities include `repo.read`, `repo.write`, `command.execute`, `pr.create`, `pr.merge`, and `channel.reply`. A gateway validates repository, endpoint, operation, budget, epoch, and capability. Natural-language scope remains a model-assisted judgment, not a formal authorization proof.
+Capabilities include `repo.read`, `repo.write`, `command.execute`, `pr.create`, `pr.merge`, and `channel.reply`. A gateway validates repository, endpoint, operation, budget, epoch, and capability. Natural-language scope remains a model-assisted judgment, not a formal authorization proof. These fine-grained checks describe structured gateways. An explicitly enabled trusted local shell can use the OS account’s network and credentials; command.execute in that mode is a broad grant and cannot enforce a separate no-merge guarantee. Enforce such boundaries with an isolated execution identity/sandbox or leave broad shell disabled.
 
 ## Atomic acceptance and delivery
 
