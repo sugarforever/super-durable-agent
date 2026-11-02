@@ -4,7 +4,7 @@ The [checkpoint table](checkpoints.md) identifies which features exist in each P
 
 ## Open, inspect, and close
 
-`openSuperAgent({ directory, models?, model?, instanceId?, maxPending?, maxIndexEntries?, preflight? })` acquires the local single-writer lock, opens SQLite, validates recovery metadata, and returns the runtime. Default bounds are 10,000 pending inputs and 10,000 entries per record-kind index. These are bounded first-release indexes, not unlimited historical retention.
+`openSuperAgent({ directory, models?, model?, instanceId?, maxPending?, maxIndexEntries?, clock?, cancellationHandler?, environment?, preflight? })` acquires the local single-writer lock, opens SQLite, validates recovery metadata, and returns the runtime. Default bounds are 10,000 pending inputs and 10,000 entries per record-kind index. These are bounded first-release indexes, not unlimited historical retention.
 
 The runtime exposes `engine`, `harness`, `control`, `artifactRoot`, `receive`, `receiveBatch`, `readTicket`, `list`, and `close`. The domain facade also exposes Policy, decision, subscription, handback, stop, and end operations. Use `close()` in a finally block.
 
@@ -75,3 +75,13 @@ The shared Engine scheduler reserves three ordinary slots and one slot for a hum
 `retryTicket(ticketId, actor, meta)` requires an authenticated allowed human or operator, revalidates current Policy, and creates a new Assignment/epoch. It preserves Worker context and requeues unread obligations. Old cancellation must be confirmed before the reused conversation can execute the new assignment. Pumping alone never resumes stopped work.
 
 Trusted hosts can configure a `cancellationHandler` for epoch-specific endpoint cancellation, returning the same cancelKey and payloadDigest with confirmed or unknown outcome. Job accounting uses the shared pending/running/cancelPending/unknown/completed/cancelled/failed states. A terminal receipt updates accounting after stop without creating new progress or feedback.
+
+## Environments and Jobs
+
+Configure a local broker with `environment: { repository: "/absolute/repository", directory: "/absolute/broker-state", trustedLocalShell: false }`, or inject `environment: { broker }` implementing EnvironmentBroker. The broker ledger is separate from pi state and must be retained for recovery. Model-enabled runtimes expose it through `agents.jobs`; execution tools fail closed when no broker is configured.
+
+Worker tools start_job, get_job, stop_job, read_file, write_file, and edit_file bind to the conversation’s Ticket and current Assignment. A Job start returns its ID before subprocess completion. Background native Job tasks record admission, query the broker on recovery, and deliver a deduplicated result only for the still-current epoch. Feedback can reach the Worker while the Job runs. Stale completion receipts update accounting without creating fresh Worker input.
+
+Broker prepare, execute, query, cancel, and release operations bind stable IDs to canonical payload digests and Ticket/Assignment/Mandate identity. Local preparation records an immutable base commit and uses a detached per-Ticket worktree. Repeated preparation preserves changes; unknown paths are never reset or overwritten. Structured operations reject traversal, repository metadata access, and symlink escapes. An unavailable requested sandbox is an error. These checks assume no hostile concurrent filesystem writer; they are not an OS sandbox.
+
+Shell Jobs require command.execute and explicit trustedLocalShell configuration. Output is bounded. If a process dies after command admission without a trustworthy completion receipt, recovery records unknown and quarantines its reservation; it does not execute the command again. Cancel confirms process termination where observable, without claiming external effects were undone.

@@ -1,3 +1,5 @@
+import { Jobs, type EnvironmentOptions } from "../services/jobs.js";
+import { join } from "node:path";
 import { Cancellation, type CancellationHandler } from "../services/cancellation.js";
 import type { Reservation } from "../runtime/scheduler.js";
 import { reconcile } from "../runtime/reconcile.js";
@@ -68,6 +70,8 @@ interface Note {
   kind?: "policy";
   policyVersion?: number;
   human?: boolean;
+  /** Endpoint result notes stay bound to their originating assignment epoch. */
+  epoch?: number;
 }
 export interface WorkerReport {
   reportId: string;
@@ -133,6 +137,7 @@ export class AgentCoordinator {
   routerConversationId!: ConversationId;
   readonly artifactRoot: string;
   readonly cancellation: Cancellation;
+  readonly jobs: Jobs;
   private stopped = false;
   private timer?: ReturnType<typeof setTimeout>;
   private pumping?: Promise<void>;
@@ -141,9 +146,11 @@ export class AgentCoordinator {
     readonly artifacts: Artifacts,
     readonly model?: ModelRef,
     cancellationHandler?: CancellationHandler,
+    environment?: EnvironmentOptions,
   ) {
     this.artifactRoot = artifacts.root;
-    this.cancellation = new Cancellation(engine, cancellationHandler);
+    this.jobs = new Jobs(engine, environment, join(artifacts.root, "..", "environments"), () => this.kick());
+    this.cancellation = new Cancellation(engine, environment ? this.jobs.cancellationHandler(cancellationHandler) : cancellationHandler);
     const tool = (
       name: string,
       description: string,
@@ -261,6 +268,14 @@ export class AgentCoordinator {
             },
           ),
         ),
+        tool("start_job", "Start a bound asynchronous shell Job and return its stable jobId immediately. Requires host trustedLocalShell and command.execute. Shell has OS account authority; sandbox requests fail closed when unavailable.",
+          Type.Object({ assignmentId: str(), epoch: Type.Integer({ minimum: 1 }), command: str(), sandbox: Type.Optional(Type.Boolean()) }),
+          (a, api) => this.jobs.start(api.conversationId, a, api.callId)),
+        tool("get_job", "Read only this Worker's Job status and endpoint receipt.", Type.Object({ jobId: str() }), (a, api) => this.jobs.get(api.conversationId, a.jobId)),
+        tool("stop_job", "Cancel only this Worker's Job operation; termination does not roll back effects.", Type.Object({ jobId: str() }), (a, api) => this.jobs.stop(api.conversationId, a.jobId)),
+        ...(["read", "write", "edit"] as const).map(kind => tool(`${kind}_file`, "Operate on a canonical path inside the assigned worktree, with fresh repo capabilities and symlink escape checks.",
+          Type.Object({ assignmentId: str(), epoch: Type.Integer({ minimum: 1 }), path: str(), ...(kind === "write" ? { text: Type.String() } : kind === "edit" ? { oldText: str(), newText: Type.String() } : {}) }),
+          (a, api) => this.jobs.file(api.conversationId, { ...a, kind }, api.callId))),
         recall,
       ],
     });
@@ -400,7 +415,7 @@ export class AgentCoordinator {
       for (const note of await store.listInTransaction<Note>(tx, "workerNote")) {
         if (note.status !== "pending" || await store.get(tx, "deliveryRun", note.id)) continue;
         const ticket = await store.get<Ticket>(tx, "ticket", note.ticketId);
-        if (ticket?.lifecycle === "open") await this.engine.scheduler.enqueue(tx, ticket, note.human === true);
+        if (ticket?.lifecycle === "open" && (note.epoch === undefined || note.epoch === ticket.assignmentEpoch)) await this.engine.scheduler.enqueue(tx, ticket, note.human === true);
       }
       await this.engine.scheduler.dispatch(tx);
     });
@@ -469,7 +484,7 @@ export class AgentCoordinator {
       )
         continue;
       const ticket = await store.read<Ticket>("ticket", note.ticketId);
-      if (!ticket?.workerConversationId || ticket.lifecycle !== "open" || !(await this.engine.transaction(tx => this.engine.scheduler.holds(tx, ticket.id, ticket.assignmentEpoch))))
+      if (!ticket?.workerConversationId || ticket.lifecycle !== "open" || (note.epoch !== undefined && note.epoch !== ticket.assignmentEpoch) || !(await this.engine.transaction(tx => this.engine.scheduler.holds(tx, ticket.id, ticket.assignmentEpoch))))
         continue;
       const policy =
         note.kind === "policy"
@@ -1517,6 +1532,7 @@ export class AgentCoordinator {
           CancelIntent & { taskId?: TaskId<null> }
         >("cancel")),
         ...(await this.engine.store.list<{ taskId?: TaskId<null> }>("redrive")),
+        ...(await this.engine.store.list<{ taskId?: TaskId<null> }>("job")),
       ];
       for (const c of cancels)
         if (c.taskId) {
@@ -1536,6 +1552,7 @@ export class AgentCoordinator {
         const auxiliary = [
           ...(await this.engine.store.list<CancelIntent>("cancel")),
           ...(await this.engine.store.list<{ taskId?: TaskId<null>; status?: string }>("redrive")),
+          ...(await this.engine.store.list<{ taskId?: TaskId<null>; status?: string }>("job")),
         ];
         let auxiliaryLive = false;
         for (const claim of auxiliary) {

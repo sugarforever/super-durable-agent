@@ -1,3 +1,4 @@
+import type { EnvironmentOptions } from "../services/jobs.js";
 import { reconcile } from "./reconcile.js";
 import type { Clock } from "./scheduler.js";
 import type { CancellationHandler } from "../services/cancellation.js";
@@ -44,6 +45,7 @@ export interface OpenOptions {
   maxIndexEntries?: number;
   clock?: Clock;
   cancellationHandler?: CancellationHandler;
+  environment?: EnvironmentOptions;
   /** Additional recovery checks run while scheduling is paused. Throwing closes storage and releases the lock. */
   preflight?: (engine: Engine) => Promise<void>;
 }
@@ -189,7 +191,7 @@ export async function openSuperAgent(
         ...(body.artifact ? { bodyArtifact: body.artifact } : {}),
       };
     };
-    const coordinator = new AgentCoordinator(engine, artifacts, options.model, options.cancellationHandler);
+    const coordinator = new AgentCoordinator(engine, artifacts, options.model, options.cancellationHandler, options.environment);
     registry.install(coordinator.routerExtension);
     registry.install(coordinator.workerExtension);
     registry.install(
@@ -199,6 +201,7 @@ export async function openSuperAgent(
           coordinator.inputTask,
           coordinator.cancelTask,
           coordinator.redriveTask,
+          coordinator.jobs.task,
         ],
       }),
     );
@@ -228,7 +231,8 @@ export async function openSuperAgent(
       if (
         canonicalJson(previousDefinitions) !== canonicalJson(definitions) &&
         canonicalJson(previousDefinitions) !==
-          canonicalJson(baselineDefinitions)
+          canonicalJson(baselineDefinitions) &&
+        canonicalJson(previousDefinitions) !== canonicalJson({ ...definitions, tasks: Object.fromEntries(Object.entries(definitions.tasks).filter(([name]) => name !== "sa.job")) })
       ) {
         throw new Error(
           "Installed extension/task definitions do not match persisted metadata",
