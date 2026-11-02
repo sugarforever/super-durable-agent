@@ -65,3 +65,13 @@ Artifacts spill above 16 KiB UTF-8, retaining a bounded excerpt and SHA-256 refe
 ## Execution authority
 
 Fine-grained capabilities apply to structured gateways. Enabling a trusted local shell with command.execute grants the OS account's command, filesystem, network, and credential reach; it cannot enforce a separate no-merge/no-network guarantee by checking a tool name. Use an isolated execution identity/sandbox when those guarantees are required. The worktree itself is not that boundary.
+
+## Capacity, stop, and retry
+
+The shared Engine scheduler reserves three ordinary slots and one slot for a human waking an existing Worker. New work uses ordinary capacity. Preparation counts immediately; active generation and pending/running/unknown Jobs retain capacity. Existing active steering shares its reservation. Human wakes have priority, with ordinary FIFO admission after three bypasses when an ordinary slot is available. Startup reconstructs live native admission and generation before dispatch resumes.
+
+`stopTicket(ticketId, actor, meta)` revokes authority before cancellation effects. Cancellation targets that Ticket's epoch, Worker, and registered background work. Confirmed native cancellation is a persisted checkpoint; endpoint-only retries do not repeat Worker abort. Confirmation never downgrades to unknown. Unknown endpoint outcomes retain or quarantine capacity and require receipt reconciliation. Cancellation does not undo external effects already performed.
+
+`retryTicket(ticketId, actor, meta)` requires an authenticated allowed human or operator, revalidates current Policy, and creates a new Assignment/epoch. It preserves Worker context and requeues unread obligations. Old cancellation must be confirmed before the reused conversation can execute the new assignment. Pumping alone never resumes stopped work.
+
+Trusted hosts can configure a `cancellationHandler` for epoch-specific endpoint cancellation, returning the same cancelKey and payloadDigest with confirmed or unknown outcome. Job accounting uses the shared pending/running/cancelPending/unknown/completed/cancelled/failed states. A terminal receipt updates accounting after stop without creating new progress or feedback.
