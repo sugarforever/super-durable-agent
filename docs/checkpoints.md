@@ -11,7 +11,7 @@ Each row corresponds to one requirement issue and one incremental PR. A PR targe
 | 5 | Capacity scheduling and cancellation fencing | [#5](https://github.com/sugarforever/super-durable-agent/issues/5) | [#15](https://github.com/sugarforever/super-durable-agent/pull/15) | `codex/04-agent-conversations` | Implemented; user approval pending |
 | 6 | Local environments and asynchronous jobs | [#6](https://github.com/sugarforever/super-durable-agent/issues/6) | [#16](https://github.com/sugarforever/super-durable-agent/pull/16) | `codex/05-scheduling-cancellation` | Implemented; user approval pending |
 | 7 | Transactional Outbox and external effect recovery | [#7](https://github.com/sugarforever/super-durable-agent/issues/7) | [#17](https://github.com/sugarforever/super-durable-agent/pull/17) | `codex/06-environments-jobs` | Implemented; user approval pending |
-| 8 | CLI, GitHub integration and management API | [#8](https://github.com/sugarforever/super-durable-agent/issues/8) | Pending | `codex/07-outbox` | Planned |
+| 8 | CLI, GitHub integration and management API | [#8](https://github.com/sugarforever/super-durable-agent/issues/8) | [#18](https://github.com/sugarforever/super-durable-agent/pull/18) | `codex/07-outbox` | Implemented; user approval pending |
 | 9 | Remote endpoint daemon and Feishu integration | [#9](https://github.com/sugarforever/super-durable-agent/issues/9) | Pending | `codex/08-github-management` | Planned |
 | 10 | Independent Watchdog and operational recovery | [#10](https://github.com/sugarforever/super-durable-agent/issues/10) | Pending | `codex/09-remote-feishu` | Planned |
 
@@ -75,3 +75,7 @@ Implementation commit `98472cc`. 135 tests across eight files pass, plus typeche
 ## Part 7 evidence
 
 Implementation commit `48aaeeb`. 159 tests across nine files pass, plus typecheck/build, seven pi probes and English-document checks. Independent scoped review cleared the overdue retry/disabled-source wakeup fix; native tests verify automatic progress without manual reconciliation. Controlled HTTP/SIGKILL recovery observes one POST. No live provider/account trial was executed. Independent scoped specification/quality review completed with important findings resolved. User approval and merge remain pending.
+
+## Part 8 evidence
+
+Implementation commit `7475ff8`. 198 tests across ten files pass, plus typecheck/build, seven pi probes and eight English-document checks. Independent scoped correction review cleared all five findings: final answer/lifecycle races, unsigned event-family substitution, copied markers, CI human classification, and recent receipt lookup. Native tests cover early echo ordering and model-free receipt/startup completion. No live account or hosted-model trial was executed. Independent scoped specification/quality review completed with important findings resolved. User approval and merge remain pending.
