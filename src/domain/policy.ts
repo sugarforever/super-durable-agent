@@ -45,6 +45,14 @@ export class PolicyController {
         ruleIds.add(rule.id); for (const capability of rule.capabilities) nonempty(capability, 'capability');
       }
       await this.store.put(tx, 'policy', 'current', policy);
+      for (const ticket of await this.store.listInTransaction<Ticket>(tx, 'ticket')) {
+        if (ticket.lifecycle !== 'open') continue;
+        const id = this.id('policyNotice', ticket.id, String(policy.version));
+        await this.store.put(tx, 'workerNote', id, {
+          id, ticketId: ticket.id, status: 'pending', kind: 'policy', policyVersion: policy.version,
+          text: `Policy version ${policy.version} changed. Recall current instructions; this notice does not widen the original Mandate.`,
+        });
+      }
       const unresolved = new Set<string>();
       for (const evaluation of await this.store.listInTransaction<Eval>(tx, 'eval')) {
         if (evaluation.status !== 'pending') continue;
@@ -307,7 +315,7 @@ export class PolicyController {
     for (const delivery of await this.store.listInTransaction<DeliveryIntent>(tx, 'delivery')) {
       if (delivery.ticketId === ticketId && delivery.triggerId === triggerId && delivery.status === 'pending') await this.store.put(tx, 'delivery', delivery.id, { ...delivery, status: 'invalid' });
     }
-    if (!next.acknowledged && !this.remainingOwners(next).length) {
+    if (!next.acknowledged && !(next.consumedTicketIds?.length) && !this.remainingOwners(next).length) {
       const evaluations = await this.store.listInTransaction<Eval>(tx, 'eval');
       const existing = evaluations.filter(e => e.triggerIds.includes(triggerId));
       if (!existing.some(e => e.status === 'pending')) {
@@ -337,7 +345,9 @@ export class PolicyController {
     if (!ticket || ticket.lifecycle === 'stopped' || ticket.assignmentEpoch !== epoch) throw new Error('Stale input acknowledgement epoch');
     const disposition = await this.store.get<Disposition>(tx, 'disposition', triggerId);
     if (!disposition?.ownerTickets.includes(ticketId) || disposition.handbacks.some(back => back.ticketId === ticketId && back.epoch === disposition.epoch)) throw new Error('Input acknowledgement requires current ownership');
-    await this.store.put(tx, 'disposition', triggerId, { ...disposition, acknowledged: true });
+    const consumedTicketIds = [...new Set([...(disposition.consumedTicketIds ?? []), ticketId])];
+    const acknowledged = this.remainingOwners(disposition).every(id => consumedTicketIds.includes(id));
+    await this.store.put(tx, 'disposition', triggerId, { ...disposition, consumedTicketIds, acknowledged });
     for (const delivery of await this.store.listInTransaction<DeliveryIntent>(tx, 'delivery')) {
       if (delivery.ticketId === ticketId && delivery.triggerId === triggerId && delivery.status === 'pending') await this.store.put(tx, 'delivery', delivery.id, { ...delivery, status: 'delivered' });
     }
@@ -351,6 +361,9 @@ export class PolicyController {
       if (meta.triggerId !== undefined) {
         const trigger = await this.store.get<Trigger>(tx, 'trigger', meta.triggerId);
         if (!trigger || !human(trigger.actor) || trigger.actor.id !== actor.id) throw new Error('Stop input must belong to its authenticated human actor');
+        const ticket = await this.store.get<Ticket>(tx, 'ticket', ticketId);
+        const mandate = ticket ? await this.store.get<Mandate>(tx, 'mandate', ticket.mandateId) : undefined;
+        if (!mandate || mandate.sourceId !== trigger.sourceId || !trigger.threads.some(ref => mandate.scope.includes(ref)) || !(await this.permittedThreads(tx, trigger)).length) throw new Error('Stop input source scope denied');
       }
       await this.stopInTransaction(tx, ticketId, 'Stopped by human', meta.expectedRevision, meta.triggerId === undefined ? [] : [meta.triggerId]);
     });
@@ -437,7 +450,7 @@ export class PolicyController {
     if ((await this.store.listInTransaction<EvalQueue>(tx, 'evalQueue')).some(q => q.triggerIds.includes(triggerId))) return;
     if ((await this.store.listInTransaction<DeliveryIntent>(tx, 'delivery')).some(d => d.status === 'pending' && d.triggerId === triggerId)) return;
     const disposition = await this.store.get<Disposition>(tx, 'disposition', triggerId);
-    if (disposition && !disposition.acknowledged && this.remainingOwners(disposition).length) return;
+    if (disposition && this.remainingOwners(disposition).some(id => !disposition.consumedTicketIds?.includes(id))) return;
     const state = await this.store.get<{ count: number; lastOrdinal: number }>(tx, 'state', 'intake');
     if (!state || state.count < 1) throw new Error('Intake accounting underflow');
     await this.store.put(tx, 'state', 'intake', { ...state, count: state.count - 1 });

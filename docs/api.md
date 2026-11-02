@@ -1,0 +1,63 @@
+# Runtime API
+
+The [checkpoint table](checkpoints.md) identifies which features exist in each PR. Compile with `npm run build`; the runtime entry point is `dist/runtime/open.js`. All state changes use the same Engine/Harness.
+
+## Open, inspect, and close
+
+`openSuperAgent({ directory, models?, model?, instanceId?, maxPending?, maxIndexEntries?, preflight? })` acquires the local single-writer lock, opens SQLite, validates recovery metadata, and returns the runtime. Default bounds are 10,000 pending inputs and 10,000 entries per record-kind index. These are bounded first-release indexes, not unlimited historical retention.
+
+The runtime exposes `engine`, `harness`, `control`, `artifactRoot`, `receive`, `receiveBatch`, `readTicket`, `list`, and `close`. The domain facade also exposes Policy, decision, subscription, handback, stop, and end operations. Use `close()` in a finally block.
+
+Without `model`, domain operations need no provider credentials. If existing agent work needs a provider, a model-free reopen leaves scheduling paused. This is an inspection/recovery mode, not a guarantee against a trusted host explicitly calling low-level Harness methods that enable progress.
+
+With `models` and a `model: { provider, modelId }`, `runtime.agents` is an AgentCoordinator. Register the intended provider in the pi-ai Models collection before opening. Models and credentials are host configuration, not message content.
+
+## Domain commands
+
+Normalized events contain sourceId, externalId, revision, actor, threads, body, receivedAt, occurredAt, and optional addressed. Event identity binds meaningful content, ignoring transport receipt time. Reusing an external key for changed content fails; edits use a new revision.
+
+Mutations take a `CommandMeta` with a stable commandId and optional expectedRevision. The key binds the canonical command payload. A different payload using the same key fails. A stop can include triggerId to identify the authenticated stop message so it is not accidentally treated as fresh work.
+
+The public Engine is a trusted application boundary. Network adapters must derive Actor identity from authentication. Model tools use the stored conversation/Ticket binding and never accept a caller-created operator Actor.
+
+Policy contains version, acceptMode, allowedActors, botActors, rules, and optional explicitCapabilities. Explicit requests default to `repo.read` and `channel.reply`; other capabilities require trusted configuration. Inferred acceptance requires enabled matching rules. Tool arguments cannot increase the grant.
+
+## Coordinator and delivery
+
+- `pump()` durably claims pending work and creates finite background Tasks; it returns before model completion.
+- `deliverPending()` invokes the same pump and does not promise input placement.
+- `waitForIdle()` explicitly joins background input/redrive/cancellation work and ordinary generation, including newly promoted work.
+- `ensureWorker(ticketId)` atomically creates/configures/binds one ownerless Worker, or returns the existing numeric ConversationId.
+- `submitDelivery(id, exactPrompt?)` is a trusted-host replay helper; a changed prompt or digest conflicts.
+- `noteWorker(routerConversationId, ticketId, text, id, mode?)` creates factual context without authority. Normal notes use followUp; trusted host corrections may select steer.
+- `decideBatch(routerConversationId, decisions, callId?)` returns independent success/error outcomes for each item.
+
+Native admission, placement, application consumption, and settlement are distinct. Delivery records freeze the exact prompt, digest, requestId, mode, and input ID before submit. After a crash at admission, repeat the same requestId. Intentional bounded retries after terminal failure have separate persisted attempt identities. A durable redrive boundary can recover stranded native inbox items without readmitting the original queued input.
+
+## Structured reports
+
+`agents.report(boundWorkerConversationId, report)` validates the live Ticket, bound Worker, assignmentId/epoch, known input IDs, native placement, and payload-bound reportId. Input consumption is per owner: one Worker's report cannot consume another Worker's unread feedback.
+
+```typescript
+const report = {
+  reportId: 'stable-report-id',
+  assignmentId: currentAssignmentId,
+  epoch: currentAssignmentEpoch,
+  inputIds: [deliveryRun.inputId],
+  status: 'waiting',
+  content: { summary: 'Input handled; waiting for the next event.' },
+};
+await runtime.agents.report(workerConversationId, report);
+```
+
+The native layer initially accepts waiting, ready, and attention. Later lifecycle checkpoints extend outcome handling. Ready is a structured reviewable result, not automatic PR acceptance or Ticket completion. Plain final prose without a report requires attention and leaves input consumption outstanding.
+
+## Artifact recall
+
+`agents.recall(conversationId, ref, cursor?)` returns text, estimatedTokens, and an optional next cursor. References are Trigger, delivery-run, note, or Report receipt IDs, or `ticket:<id>`. Naked content digests and source-supplied pointers do not grant access. Every page rechecks the role and Ticket scope.
+
+Artifacts spill above 16 KiB UTF-8, retaining a bounded excerpt and SHA-256 reference. Recall pages are limited to 2,000 UTF-16 units / 8,000 UTF-8 bytes without splitting surrogate pairs. The byte-based token estimate is conservative, not an exact tokenizer measurement. Include artifactRoot in backups; SQLite alone cannot restore spilled context.
+
+## Execution authority
+
+Fine-grained capabilities apply to structured gateways. Enabling a trusted local shell with command.execute grants the OS account's command, filesystem, network, and credential reach; it cannot enforce a separate no-merge/no-network guarantee by checking a tool name. Use an isolated execution identity/sandbox when those guarantees are required. The worktree itself is not that boundary.

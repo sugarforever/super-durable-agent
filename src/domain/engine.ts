@@ -4,7 +4,7 @@ import { DomainStore } from './store.js';
 import { PolicyController } from './policy.js';
 import type { Actor, CommandMeta, DecisionOutcome, Policy } from './model.js';
 import { digest, normalizeEvent, scopedId, type AuditEvent, type IntakeIntent, type NormalizedEvent,
-  type ReceiveBatchResult, type ReceiveResult, type Source, type SourceCursor, type Thread, type Trigger } from './model.js';
+  type ReceiveBatchResult, type ReceiveResult, type Source, type SourceCursor, type Thread, type Trigger, type PreparedEvent } from './model.js';
 export type { Tx } from '@earendil-works/pi-durable';
 
 class PendingCapacity extends Error {}
@@ -31,6 +31,8 @@ export function createIntakeTask(store: DomainStore) {
 }
 export class Engine {
   readonly authorization = new PolicyController(this);
+  /** Host preprocessing performs artifact IO before entering a transaction. */
+  prepareEvent?: (event: NormalizedEvent) => Promise<PreparedEvent>;
 
   updatePolicy(policy: Policy, actor: Actor, meta: CommandMeta) { return this.authorization.updatePolicy(policy, actor, meta); }
   listCandidates() { return this.authorization.listCandidates(); }
@@ -86,7 +88,8 @@ export class Engine {
   }
 
   async receive(event: NormalizedEvent): Promise<ReceiveResult> {
-    const normalized = normalizeEvent(event);
+    const clean = normalizeEvent(event);
+    const normalized = this.prepareEvent ? await this.prepareEvent(clean) : clean;
     try { return await this.transaction((tx) => this.receiveInTransaction(tx, normalized)); }
     catch (error) {
       if (error instanceof PendingCapacity) return { disposition: 'backpressure', retryable: true };
@@ -99,7 +102,10 @@ export class Engine {
       throw new Error('Batch events and cursor must have the same source');
     }
     digest(cursor.value);
-    const normalized = events.map(normalizeEvent);
+    const normalized = await Promise.all(events.map(async event => {
+      const clean = normalizeEvent(event);
+      return this.prepareEvent ? this.prepareEvent(clean) : clean;
+    }));
     try {
       return await this.transaction(async (tx) => {
         const source = await this.store.get<Source>(tx, 'source', cursor.sourceId);
@@ -115,7 +121,7 @@ export class Engine {
     }
   }
 
-  async receiveInTransaction(tx: Tx, event: NormalizedEvent): Promise<ReceiveResult> {
+  async receiveInTransaction(tx: Tx, event: PreparedEvent): Promise<ReceiveResult> {
     const id = scopedId(this.instanceId, 'trigger', [event.sourceId, event.externalId, event.revision]);
     const { receivedAt: _receivedAt, ...stablePayload } = event;
     const hash = digest(stablePayload);

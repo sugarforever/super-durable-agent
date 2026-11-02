@@ -23,7 +23,8 @@ export interface Source {
   listenedScopes?: string[];
   cursor?: JsonValue;
 }
-export interface Trigger extends NormalizedEvent { id: ID; ordinal: number; digest: string }
+export interface PreparedEvent extends NormalizedEvent { bodyArtifact?: string }
+export interface Trigger extends PreparedEvent { id: ID; ordinal: number; digest: string }
 export interface Thread { id: ID; sourceId: ID; externalRef: string; triggerIds: ID[]; lastOrdinal: number }
 export interface IntakeIntent { id: ID; triggerId: ID; status: 'pending' | 'accepted'; taskId: TaskId<null>; routed?: boolean; released?: boolean }
 export interface AuditEvent { id: ID; kind: 'trigger.received'; triggerId: ID; occurredAt: number }
@@ -109,7 +110,7 @@ export interface Mandate {
 }
 export interface Ticket {
   id: ID; goal: string; mandateId: ID; lifecycle: 'open' | 'ended' | 'stopped'; revision: number;
-  assignmentId: ID; assignmentEpoch: number; workerConversationId?: string;
+  assignmentId: ID; assignmentEpoch: number; goalArtifact?: string; workerConversationId?: import('@earendil-works/pi-durable').ConversationId;
   latestReport?: JsonValue; attention?: string;
 }
 export interface Assignment { id: ID; ticketId: ID; epoch: number; status: 'pending' | 'running' | 'ended' | 'stopped' }
@@ -121,7 +122,7 @@ export interface Eval {
 export interface Handback { ticketId: ID; epoch: number; reason: string }
 export interface Disposition {
   triggerId: ID; ownerTickets: ID[]; contextTickets: ID[]; handbacks: Handback[];
-  acknowledged: boolean; epoch: number; conflicts: number; decisionId?: ID;
+  acknowledged: boolean; consumedTicketIds?: ID[]; epoch: number; conflicts: number; decisionId?: ID;
 }
 export interface Subscription { ticketId: ID; threadId: ID; own: boolean; active: boolean }
 export type DecisionOutcome =
@@ -132,7 +133,7 @@ export type DecisionOutcome =
 export interface Decision { id: ID; evalId: ID; epoch: number; policyVersion: number; outcome: DecisionOutcome }
 export interface DeliveryIntent {
   id: ID; ticketId: ID; triggerId: ID; epoch: number; own: boolean; resume: boolean;
-  status: 'pending' | 'delivered' | 'invalid';
+  status: 'pending' | 'delivered' | 'invalid'; mode?: 'followUp' | 'steer';
 }
 export interface CancelIntent { id: ID; ticketId: ID; assignmentId: ID; epoch: number; status: 'pending' | 'completed'; reason: string }
 export interface Report { ticketId: ID; assignmentId: ID; epoch: number; content: JsonValue }
