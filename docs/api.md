@@ -4,9 +4,9 @@ The [checkpoint table](checkpoints.md) identifies which features exist in each P
 
 ## Open, inspect, and close
 
-`openSuperAgent({ directory, models?, model?, instanceId?, maxPending?, maxIndexEntries?, clock?, cancellationHandler?, environment?, outbox?, preflight? })` acquires the local single-writer lock, opens SQLite, validates recovery metadata, and returns the runtime. Default bounds are 10,000 pending inputs and 10,000 entries per record-kind index. These are bounded first-release indexes, not unlimited historical retention.
+`openSuperAgent({ directory, models?, model?, instanceId?, maxPending?, maxIndexEntries?, clock?, cancellationHandler?, environment?, outbox?, startPaused?, preflight? })` acquires the local single-writer lock, opens SQLite, validates recovery metadata, and returns the runtime. Default bounds are 10,000 pending inputs and 10,000 entries per record-kind index. These are bounded first-release indexes, not unlimited historical retention.
 
-The runtime exposes `engine`, `harness`, `control`, `artifactRoot`, `receive`, `receiveBatch`, `readTicket`, `list`, and `close`. The domain facade also exposes Policy, decision, subscription, handback, stop, and end operations. Use `close()` in a finally block.
+The runtime exposes `engine`, `harness`, `control`, `artifactRoot`, `receive`, `receiveBatch`, `readTicket`, `list`, and `close`. The domain facade also exposes Policy, decision, subscription, handback, stop, and end operations. Use `close()` in a finally block. With startPaused, configure listeners and trusted bindings before calling activate(); activation is idempotent and retains model-free recovery restrictions.
 
 Without `model`, domain operations need no provider credentials. If existing agent work needs a provider, a model-free reopen leaves scheduling paused. This is an inspection/recovery mode, not a guarantee against a trusted host explicitly calling low-level Harness methods that enable progress.
 

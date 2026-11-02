@@ -48,6 +48,8 @@ export interface OpenOptions {
   cancellationHandler?: CancellationHandler;
   environment?: EnvironmentOptions;
   outbox?: OutboxOptions;
+  /** Defer native effects until host listeners and credentials are ready. Call activate() explicitly. */
+  startPaused?: boolean;
   /** Additional recovery checks run while scheduling is paused. Throwing closes storage and releases the lock. */
   preflight?: (engine: Engine) => Promise<void>;
 }
@@ -58,6 +60,7 @@ export interface SuperAgentRuntime {
   readonly control: Conversation;
   readonly agents: AgentCoordinator | undefined;
   readonly artifactRoot: string;
+  activate(): Promise<void>;
   close(): Promise<void>;
   updatePolicy(policy: Policy, actor: Actor, meta: CommandMeta): Promise<void>;
   listCandidates(): Promise<Eval[]>;
@@ -289,13 +292,20 @@ export async function openSuperAgent(
             task.record.kind !== "sa.intake" && task.record.kind !== "sa.outbox") ||
           task.record.kind === "pi.generation",
       );
-    if (!recoveredAgentWork) harness.resume();
     const agents = options.model ? coordinator : undefined;
-    await agents?.pump();
+    let activated = false;
+    let activation: Promise<void> | undefined;
+    const activate = () => activation ??= (async () => {
+      if (!recoveredAgentWork) harness!.resume();
+      activated = true;
+      await agents?.pump();
+    })();
+    if (!options.startPaused) await activate();
     const openedHarness = harness;
     let closing: Promise<void> | undefined;
     return {
       engine,
+      activate,
       outbox,
       harness,
       control,
@@ -303,12 +313,12 @@ export async function openSuperAgent(
       artifactRoot: artifacts.root,
       updatePolicy: async (policy, actor, meta) => {
         await engine.updatePolicy(policy, actor, meta);
-        agents?.kick();
+        if (activated) agents?.kick();
       },
       listCandidates: () => engine.listCandidates(),
       decide: async (evalId, epoch, outcome, meta) => {
         const result = await engine.decide(evalId, epoch, outcome, meta);
-        agents?.kick();
+        if (activated) agents?.kick();
         return result;
       },
       subscribe: (ticketId, sourceId, threadRef, own, meta) =>
@@ -319,11 +329,11 @@ export async function openSuperAgent(
         engine.handback(ticketId, triggerId, epoch, reason, meta),
       stopTicket: async (ticketId, actor, meta) => {
         await engine.stopTicket(ticketId, actor, meta);
-        agents?.kick();
+        if (activated) agents?.kick();
       },
       retryTicket: async (ticketId, actor, meta) => {
         await engine.retryTicket(ticketId, actor, meta);
-        agents?.kick();
+        if (activated) agents?.kick();
       },
       endTicket: (ticketId, epoch, meta) =>
         engine.endTicket(ticketId, epoch, meta),
@@ -339,12 +349,12 @@ export async function openSuperAgent(
         })()),
       receive: async (event) => {
         const result = await engine.receive(event);
-        agents?.kick();
+        if (activated) agents?.kick();
         return result;
       },
       receiveBatch: async (events, cursor) => {
         const result = await engine.receiveBatch(events, cursor);
-        agents?.kick();
+        if (activated) agents?.kick();
         return result;
       },
       readTicket: <T>(id: string) => store.read<T>("ticket", id),

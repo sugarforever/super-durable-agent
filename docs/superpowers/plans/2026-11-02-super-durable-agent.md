@@ -161,11 +161,11 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Acceptance:** Webhook signature failure never admits events; cursor commits atomically; API actor cannot be forged in body; ready PR stays open; merge with unread followup does not end work.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 9: Remote endpoint daemon and Feishu integration
 

@@ -26,5 +26,7 @@ Before each PR opens for approval, its checkpoint must record executable evidenc
 | 4 | Recover terminal auxiliary claims with bounded attempts and explicit attention | [Conversation tests](../tests/conversations.spec.ts) |
 | 5 | Make cancellation confirmation monotonic, skip confirmed native abort on endpoint retries, and reconstruct pre-admission Control work before resume | [Cancellation tests](../tests/cancellation.spec.ts), [scheduling tests](../tests/scheduling.spec.ts) |
 | 6 | Supervise the observed process group beyond shell closure, bound unknown outcomes despite inherited pipes, and bind retained worktree replay to canonical repository identity | [Job tests](../tests/jobs.spec.ts) |
+| 7 | Wake overdue retry/disabled-source intents after terminal completion without spinning on live claims | [Outbox tests](../tests/outbox.spec.ts) |
+| 8 | Validate signed-body event families; preserve copied-marker human input; classify CI as automation; recover recent receipts; wait for final outbound obligations before natural completion | [Integration tests](../tests/integrations.spec.ts) |
 
 These corrections retain the original organization while making its state transitions explicit at pi's transactional and invocation boundaries. Controlled-provider tests exercise native execution; they do not establish real-model quality or live external-service behavior.

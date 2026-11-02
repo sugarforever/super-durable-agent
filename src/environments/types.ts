@@ -27,7 +27,14 @@ export type ExecutionReceipt = ReceiptIdentity & (
 export type LifecycleReceipt = ReceiptIdentity & { status: 'released' | 'cancelled' | 'unknown'; reason?: string };
 export type PreparationReceipt = PreparedReceipt | (Omit<PreparedReceipt, 'status'> & { status: 'unknown'; reason: string });
 export type BrokerReceipt = PreparationReceipt | ExecutionReceipt | LifecycleReceipt;
+/** Transport loss is not evidence that an endpoint effect did not occur. */
+export class UncertainEnvironmentError extends Error {
+  override readonly name = 'UncertainEnvironmentError';
+  constructor(readonly operationId: string, message = 'Endpoint outcome is uncertain; inspect the existing operation') { super(message); }
+}
 export interface EnvironmentBroker {
+  /** Trusted host binds the current controller authority before recovery effects resume. */
+  bindAuthority?(authorize: EndpointAuthorizer): void;
   prepare(request: PrepareRequest): Promise<PreparedReceipt>;
   execute(request: ExecuteRequest): Promise<ExecutionReceipt>;
   query(operationId: string): Promise<BrokerReceipt | undefined>;

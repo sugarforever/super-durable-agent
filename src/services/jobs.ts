@@ -3,20 +3,21 @@ import type { Engine } from '../domain/engine.js';
 import { canonicalJson, scopedId, type Ticket, type Mandate, type Policy, type Source, type CancelIntent } from '../domain/model.js';
 import { trackExecution, recordExecutionReceipt, type ExecutionAccounting } from '../runtime/reconcile.js';
 import { LocalEnvironmentBroker } from '../environments/local.js';
-import { operationDigest, type EndpointIdentity, type EndpointGrant, type EndpointAction, type EnvironmentBroker, type ExecutionPayload, type ExecutionReceipt, type PreparedReceipt } from '../environments/types.js';
+import { UncertainEnvironmentError, operationDigest, type EndpointIdentity, type EndpointGrant, type EndpointAction, type EnvironmentBroker, type ExecutionPayload, type ExecutionReceipt, type PreparedReceipt } from '../environments/types.js';
 import { createJobTask } from '../durable/tasks/job.js';
 import type { CancellationHandler } from './cancellation.js';
 export type EnvironmentOptions = { repository: string; directory?: string; trustedLocalShell?: boolean } | { broker: EnvironmentBroker };
 export interface StartJob { assignmentId: string; epoch: number; command: string; sandbox?: boolean }
 export interface Job extends ExecutionAccounting {
   identity: EndpointIdentity; operationId: string; commandDigest: string; action: { kind: 'shell'; command: string; sandbox?: boolean };
-  taskId: TaskId<null>; environmentId?: string; payloadDigest?: string; payload?: ExecutionPayload; receipt?: ExecutionReceipt; notified?: boolean;
+  taskId: TaskId<null>; preparationOperationId?: string; environmentId?: string; payloadDigest?: string; payload?: ExecutionPayload; receipt?: ExecutionReceipt; notified?: boolean;
 }
 export class Jobs {
   readonly task = createJobTask(this);
   readonly broker?: EnvironmentBroker;
   constructor(readonly engine: Engine, options: EnvironmentOptions | undefined, directory: string, readonly kick: () => void) {
     this.broker = options && ('broker' in options ? options.broker : new LocalEnvironmentBroker({ ...options, directory: options.directory ?? directory, authorize: (identity, action) => this.authorize(identity, action) }));
+    this.broker?.bindAuthority?.((identity, action) => this.authorize(identity, action));
   }
   private endpoint(): EnvironmentBroker { if (!this.broker) throw new Error('Environment broker is not configured'); return this.broker; }
   private async bound(tx: Tx, conversationId: ConversationId, expected?: { assignmentId: string; epoch: number }): Promise<Ticket> {
@@ -69,7 +70,7 @@ export class Jobs {
       const accounting: ExecutionAccounting = { id, ticketId: ticket.id, assignmentId: ticket.assignmentId, epoch: ticket.assignmentEpoch, status: 'pending' };
       await trackExecution(this.engine, tx, accounting);
       const taskId = await tx.createTask(this.task, { jobId: id }, { ownership: { kind: 'conversation' }, background: true });
-      await this.engine.store.put(tx, 'job', id, { ...accounting, identity, operationId: `execute:${id}`, commandDigest, action, taskId } satisfies Job);
+      await this.engine.store.put(tx, 'job', id, { ...accounting, identity, operationId: `execute:${id}`, preparationOperationId: `prepare:${identity.ticketId}:${identity.assignmentId}:${identity.epoch}`, commandDigest, action, taskId } satisfies Job);
     });
     return { jobId: id };
   }
@@ -133,8 +134,11 @@ export class Jobs {
       } finally { signal.removeEventListener('abort', abort); }
     } catch (error) {
       const current = (await this.engine.store.read<Job>('job', id))!;
-      const receipt = await this.endpoint().query(current.operationId);
-      await this.finish(id, receipt ? receipt as ExecutionReceipt : { operationId: current.operationId, identity: current.identity, payloadDigest: current.payloadDigest ?? current.commandDigest, status: 'failed', reason: error instanceof Error ? error.message : String(error) });
+      let uncertain = error instanceof UncertainEnvironmentError;
+      let receipt: Awaited<ReturnType<EnvironmentBroker['query']>>;
+      try { receipt = await this.endpoint().query(current.operationId); }
+      catch { uncertain = true; }
+      await this.finish(id, receipt ? receipt as ExecutionReceipt : { operationId: current.operationId, identity: current.identity, payloadDigest: current.payloadDigest ?? current.commandDigest, status: uncertain ? 'unknown' : 'failed', reason: uncertain ? 'Endpoint outcome is uncertain; inspect the existing execution and preparation operation IDs' : error instanceof Error ? error.message : String(error) });
     }
   }
   async cancelExecution(id: string): Promise<void> {
