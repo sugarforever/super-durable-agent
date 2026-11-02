@@ -123,10 +123,21 @@ export class Outbox {
     await this.arm();
   }
   private async arm(): Promise<void> {
+    if (this.closed) return;
+    const deadlines = await this.engine.transaction(async tx => {
+      const eligible: number[] = [];
+      for (const message of await this.engine.store.listInTransaction<OutboundMessage>(tx, 'outbox')) {
+        if (!pending(message) || !this.adapters.has(message.destination.sourceId)) continue;
+        const task = message.taskId ? await tx.task(message.taskId) : undefined;
+        // A live claim owns progress until its terminal completion calls arm again.
+        // Include overdue terminal/missing claims: completion may occur after a
+        // persisted deferral deadline, and no unrelated event need arrive.
+        if (!task || task.state.status === 'terminal') eligible.push(message.nextAttemptAt);
+      }
+      return eligible;
+    });
     if (this.timer) clearTimeout(this.timer);
     if (this.closed) return;
-    const messages = await this.engine.store.list<OutboundMessage>('outbox');
-    const deadlines = messages.filter(m => pending(m) && this.adapters.has(m.destination.sourceId) && m.nextAttemptAt > this.clock.now()).map(m => m.nextAttemptAt);
     if (deadlines.length) {
       const delay = Math.max(10, Math.min(60_000, Math.min(...deadlines) - this.clock.now()));
       this.timer = setTimeout(() => { this.timer = undefined; void this.reconcile().catch(() => { /* Durable intents remain for explicit reconciliation. */ }); }, delay);

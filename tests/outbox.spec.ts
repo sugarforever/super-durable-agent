@@ -259,3 +259,22 @@ describe('trusted provider receipt inspection', () => {
     expect(sender.observed).toHaveLength(1); expect(await f.r.readTicket(f.ticket.id)).toEqual(stopped);
   });
 });
+
+describe('overdue native sender completion', () => {
+  it.each(['retry', 'disabled'] as const)('automatically wakes an already due %s intent after terminal completion without a pump', async kind => {
+    let now = Date.now(); const sender = new Sender();
+    if (kind === 'retry') sender.operation = async () => { throw new NoSendError('certified no effect'); };
+    else sender.enabled = false;
+    const f = await setup(sender, { clock: { now: () => now } }), b = barrier();
+    const completed = f.r.outbox.completed.bind(f.r.outbox);
+    f.r.outbox.completed = async () => { await b.wait(); await completed(); };
+    await f.enqueue(); await b.entered;
+    const deferred = await state(f);
+    expect(deferred).toMatchObject({ status: kind === 'retry' ? 'retrying' : 'pending', attempt: kind === 'retry' ? 1 : 0, nextAttemptAt: now + 2000 });
+    expect((await f.r.harness.getTask(deferred.taskId, f.r.engine.context))?.state.status).toBe('terminal');
+    sender.operation = undefined; sender.enabled = true; now = deferred.nextAttemptAt + 1;
+    b.release();
+    expect(await settled(f, 'sent')).toMatchObject({ attempt: kind === 'retry' ? 2 : 1, receipt: { providerId: kind === 'retry' ? '2' : '1' } });
+    expect(sender.observed).toHaveLength(kind === 'retry' ? 2 : 1);
+  });
+});
