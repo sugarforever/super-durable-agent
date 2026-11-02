@@ -5,7 +5,7 @@ Each row corresponds to one requirement issue and one incremental PR. A PR targe
 | Part | Requirement | Issue | PR | Base | Checkpoint status |
 | --- | --- | --- | --- | --- | --- |
 | 1 | English architecture and executable design checkpoints | [#1](https://github.com/sugarforever/super-durable-agent/issues/1) | [#11](https://github.com/sugarforever/super-durable-agent/pull/11) | `main` | Implemented; user approval pending |
-| 2 | Persistent domain kernel and single-writer runtime | [#2](https://github.com/sugarforever/super-durable-agent/issues/2) | Pending | `codex/01-design-baseline` | Planned |
+| 2 | Persistent domain kernel and single-writer runtime | [#2](https://github.com/sugarforever/super-durable-agent/issues/2) | [#12](https://github.com/sugarforever/super-durable-agent/pull/12) | `codex/01-design-baseline` | Implemented; user approval pending |
 | 3 | Authorization and subscription ownership | [#3](https://github.com/sugarforever/super-durable-agent/issues/3) | Pending | `codex/02-domain-kernel` | Planned |
 | 4 | Router and Worker conversations with durable delivery | [#4](https://github.com/sugarforever/super-durable-agent/issues/4) | Pending | `codex/03-policy-ownership` | Planned |
 | 5 | Capacity scheduling and cancellation fencing | [#5](https://github.com/sugarforever/super-durable-agent/issues/5) | Pending | `codex/04-agent-conversations` | Planned |
@@ -34,3 +34,7 @@ Use the PR diff against its immediate base, not main, for incremental review. CI
 ## Part 1 evidence
 
 Implementation commit `530303b` establishes the reviewed design baseline. `npm run verify:pi` passed all seven characterization probes; `node scripts/check-docs.mjs` passed six English documents and local links. Independent scoped review passed specification and quality checks with no important findings. This checkpoint records documentation/probe readiness, not runtime implementation. PR #11 remains unmerged and requires user approval.
+
+## Part 2 evidence
+
+Implementation commit `bbb2542`. 19 integration tests pass, including real SQLite reopen, atomic rollback/cursor admission, payload conflicts, CLI subprocesses, second-writer refusal, and SIGKILL lock/checkpoint recovery. Typecheck, build, and seven pi probes pass. Local validation used Node26/macOS; the native addon requires install scripts and a compiler. Routing and models are introduced in later PRs. Independent scoped specification/quality review completed with important findings resolved. User approval and merge remain pending.
