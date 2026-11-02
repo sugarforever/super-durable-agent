@@ -5,6 +5,7 @@ A pi-durable implementation of the DeepSeek Super-agent organization: a long-liv
 Development is organized as ten stacked pull requests, each linked to one requirement issue and an executable approval checkpoint. See [implementation status and checkpoints](docs/checkpoints.md) before relying on a capability.
 
 - [Architecture](docs/architecture.md): boundaries, state, event flow, authority, pi integration, and recovery.
+- [Service and GitHub setup](docs/integrations.md): CLI, credentials, roles, webhooks and PR lifecycle.
 - [Runtime API](docs/api.md): trusted host commands, native conversations, Reports, and authorized recall.
 - [Evidence](docs/research/evidence.md): original design, pinned prototype, and verified pi API baseline.
 - [Implementation plan](docs/superpowers/plans/2026-11-02-super-durable-agent.md): issue/PR split and acceptance tests.
@@ -25,4 +26,10 @@ The kernel CLI is available after `npm run build`:
 ```sh
 node dist/cli.js --directory .data init
 node dist/cli.js --directory .data list trigger
+```
+
+A credential-free native demonstration is available in a fresh directory:
+
+```sh
+node dist/cli.js --directory .data/demo demo
 ```

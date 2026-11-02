@@ -89,7 +89,7 @@ export class PolicyController {
   }
 
   /** Revalidate the existing grant; resumption never expands scope or creates a replacement Mandate. */
-  private async revalidateMandate(tx: Tx, mandate: Mandate, trigger: Trigger, policy: Policy): Promise<boolean> {
+  async revalidateMandate(tx: Tx, mandate: Mandate, trigger: Trigger, policy: Policy): Promise<boolean> {
     if (mandate.withdrawnAt !== null || mandate.sourceId !== trigger.sourceId) return false;
     const permitted = await this.permittedThreads(tx, trigger);
     const source = await this.store.get<Source>(tx, 'source', mandate.sourceId);

@@ -21,6 +21,8 @@ export interface Source {
   kind: string;
   enabled: boolean;
   listenedScopes?: string[];
+  /** Host-configured repository boundary for GitHub thread binding. */
+  repositoryAllowlist?: string[];
   cursor?: JsonValue;
 }
 export interface PreparedEvent extends NormalizedEvent { bodyArtifact?: string; /** Host-only digest of the original normalized payload before spill. */ originalDigest?: string }

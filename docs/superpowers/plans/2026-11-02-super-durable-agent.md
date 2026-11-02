@@ -35,11 +35,11 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Acceptance:** Documentation links and language audit; pi contract probes; review traceability with no unsupported production claims.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Characterize the pinned public pi APIs and audit the English design baseline; no runtime feature readiness is inferred.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 2: Persistent domain kernel and single-writer runtime
 
@@ -53,11 +53,11 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Acceptance:** Duplicate versus edited event; conflicting idempotency keys rejected; rollback of documents and tasks; no second writer; CLI round trip and SQLite reopen.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 3: Authorization and subscription ownership
 
@@ -71,11 +71,11 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Acceptance:** Authorization matrix; no new Eval for owned human feedback; bot evaluation independent of fanout; last-owner handback; revocation and stale-decision rejection.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 4: Router and Worker conversations with durable delivery
 
@@ -89,11 +89,11 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Acceptance:** Controlled provider runs real pi generation; isolated Worker history; Router cancellation independence; crash after input admission; placed versus application-consumed evidence; no implicit ready.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 5: Capacity scheduling and cancellation fencing
 
@@ -107,11 +107,11 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Acceptance:** No oversubscription after restart; ordinary work cannot consume human reserve; no duplicate capacity for steer; old report cannot revive Ticket; cancellation receipts reconcile accounting without new progress.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 6: Local environments and asynchronous jobs
 
@@ -125,11 +125,11 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Acceptance:** Real temporary repository and subprocess execution; payload-bound operation IDs; long job does not block feedback; cancellation and unknown-outcome recovery; explicit trusted-local-shell boundary.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 7: Transactional Outbox and external effect recovery
 
@@ -143,11 +143,11 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Acceptance:** Stop between enqueue and send prevents send; old messages remain fenced after reopen; found/absent/unknown receipt cases; 2s-to-60s backoff and eight-failure attention.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 8: CLI, GitHub integration and management API
 
