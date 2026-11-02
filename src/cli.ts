@@ -16,6 +16,7 @@ import type {
 } from "./domain/model.js";
 import { startManagementServer, redact } from "./api/server.js";
 import {
+  configuredPrincipals,
   configuredRemote,
   configuredFeishu,
   configObject,
@@ -35,6 +36,9 @@ Commands:
   policy set           Apply policy JSON from standard input as local operator.
   serve / run          Start authenticated HTTP service; run requires a model.
   demo                 Run deterministic native Router/Worker/feedback demo.
+  backup <NEW_PATH>    Offline backup under the primary writer lock.
+  restore <BACKUP>     Restore into a NEW --directory; external paths stay original.
+  watch                Independent supervisor; --config uses watchdog JSON.
 
 Options:
   --directory PATH / --data-dir PATH (or SUPER_AGENT_DIRECTORY)
@@ -65,6 +69,7 @@ interface Config {
   host?: string;
   port?: number;
   tokenEnv?: string;
+  managementPrincipals?: unknown;
   githubRepositories?: string[];
   githubSecretEnv?: string;
   githubTokenEnv?: string;
@@ -87,6 +92,7 @@ const allowedConfig = new Set([
   "host",
   "port",
   "tokenEnv",
+  "managementPrincipals",
   "githubRepositories",
   "githubSecretEnv",
   "githubTokenEnv",
@@ -338,6 +344,7 @@ async function demo(directory: string) {
   }
 }
 export async function main(args = process.argv.slice(2)): Promise<void> {
+  if(args[0]==="watch") {await (await import("./watchdog/cli.js")).watchdogMain(args.slice(1));return;}
   const positional: string[] = [];
   let config: Config = {
     directory: process.env.SUPER_AGENT_DIRECTORY ?? ".super-durable-agent",
@@ -408,7 +415,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   const expected = ["init", "receive", "serve", "run", "demo"].includes(command)
     ? 1
-    : command === "list" || command === "policy"
+    : command === "list" || command === "policy" || command === "backup" || command === "restore"
       ? 2
       : command === "show"
         ? 3
@@ -420,6 +427,12 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     throw new Error("Use policy get or policy set");
   if (typeof config.directory !== "string" || !config.directory.trim())
     throw new Error("Directory required");
+  if (command === "backup" || command === "restore") {
+    const {backupRuntime,restoreRuntime}=await import('./runtime/backup.js');
+    const manifest=command==='backup'?await backupRuntime(config.directory,kind):await restoreRuntime(kind,config.directory);
+    process.stdout.write(JSON.stringify({directory:resolve(command==='backup'?kind:config.directory),instanceId:manifest.metadata.instanceId,inspectionOnly:manifest.inspectionOnly,externalDependencies:manifest.external.length})+'\n');
+    return;
+  }
   if (command === "demo") {
     process.stdout.write(
       JSON.stringify(await demo(config.directory), null, 2) + "\n",
@@ -472,7 +485,8 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   const modelOptions = service ? await configuredModels(config) : {};
   if (command === "run" && !modelOptions.model)
     throw new Error("run requires --provider and --model");
-  const token = service
+  const principals = service ? configuredPrincipals(config.managementPrincipals) : undefined;
+  const token = service && (config.tokenEnv || !principals)
     ? secret(config.tokenEnv ?? "SUPER_AGENT_TOKEN", true)
     : undefined;
   const github =
@@ -554,6 +568,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
           host: config.host,
           port: config.port ?? 8787,
           token,
+          principals,
           github,
           feishu,
           remote,

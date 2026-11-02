@@ -282,6 +282,7 @@ export class RemoteEnvironmentBroker implements EnvironmentBroker {
       },
     );
     if (existing.receipt) {
+      if(existing.receipt.status==='cancelled' && !existing.delivered)return existing.receipt;
       if (this.options.transport === "http") {
         const current = await this.query(id);
         if (this.continuityLost)
@@ -317,7 +318,12 @@ export class RemoteEnvironmentBroker implements EnvironmentBroker {
           return prior ?? this.unknown(record);
         // Preparation/release/cancel are idempotent daemon operations. Shell execution is never redelivered.
       }
-      await this.persist({ ...record, delivered: true });
+      const admitted=await this.ledger.serial(command.id,async()=>{
+        const latest=this.records.get(command.id)!;
+        if(latest.receipt)return false;
+        await this.persist({...latest,delivered:true});return true;
+      });
+      if(!admitted)return this.records.get(command.id)!.receipt!;
       try {
         const receipt = (await this.http(
           command.action,
@@ -429,15 +435,23 @@ export class RemoteEnvironmentBroker implements EnvironmentBroker {
     const original = this.records.get(operationId);
     if (!original || original.command.identity.epoch !== epoch)
       throw new Error("Unknown operation or epoch conflict");
+    await this.options.authorize(original.command.identity,'cancel');
+    await this.ledger.serial(operationId,async()=>{
+      const latest=this.records.get(operationId)!;
+      if(!latest.delivered&&!latest.receipt)await this.persist({...latest,receipt:{operationId,payloadDigest:latest.command.body.payloadDigest,identity:latest.command.identity,status:'cancelled',reason:'Cancelled before transport delivery'}});
+    });
     const result = await this.invoke(
       "cancel",
       {
         operationId: `transport-cancel:${operationId}:${epoch}`,
         targetOperationId: operationId,
         epoch,
+        target: original.command.body,
       },
       original.command.identity,
     );
+    const local = this.records.get(operationId);
+    if(local?.receipt?.status === "cancelled" && !local.delivered) return local.receipt as ExecutionReceipt;
     return {
       ...result,
       operationId,
@@ -514,11 +528,13 @@ export class RemoteEnvironmentBroker implements EnvironmentBroker {
             ) > RESPONSE_LIMIT
           )
             break;
-          records.push(record);
-          commands.push(command);
+          await this.ledger.serial(record.command.id,async()=>{
+            const latest=this.records.get(record.command.id)!;
+            if(latest.receipt||latest.error)return;
+            commands.push(command);
+            await this.persist({...latest,delivered:true});
+          });
         }
-        for (const record of records)
-          await this.persist({ ...record, delivered: true });
         sendJson(res, 200, { commands });
         return true;
       }

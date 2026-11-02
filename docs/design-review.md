@@ -28,5 +28,6 @@ Before each PR opens for approval, its checkpoint must record executable evidenc
 | 6 | Supervise the observed process group beyond shell closure, bound unknown outcomes despite inherited pipes, and bind retained worktree replay to canonical repository identity | [Job tests](../tests/jobs.spec.ts) |
 | 7 | Wake overdue retry/disabled-source intents after terminal completion without spinning on live claims | [Outbox tests](../tests/outbox.spec.ts) |
 | 8 | Validate signed-body event families; preserve copied-marker human input; classify CI as automation; recover recent receipts; wait for final outbound obligations before natural completion | [Integration tests](../tests/integrations.spec.ts) |
+| 9 | Separate operation-only cancellation from Ticket-wide epoch revocation; acknowledge Feishu intake using its durable acceptance result despite concurrent source disable | [Remote tests](../tests/remote.spec.ts), [Feishu tests](../tests/feishu.spec.ts) |
 
 These corrections retain the original organization while making its state transitions explicit at pi's transactional and invocation boundaries. Controlled-provider tests exercise native execution; they do not establish real-model quality or live external-service behavior.

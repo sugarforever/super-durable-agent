@@ -7,6 +7,7 @@ Development is organized as ten stacked pull requests, each linked to one requir
 - [Architecture](docs/architecture.md): boundaries, state, event flow, authority, pi integration, and recovery.
 - [Service and GitHub setup](docs/integrations.md): CLI, credentials, roles, webhooks and PR lifecycle.
 - [Remote execution and Feishu](docs/remote-and-feishu.md): daemon transports, endpoint continuity and verified messaging.
+- [Operations and recovery](docs/operations.md): Watchdog, migrations, backups, restore limits and deployment checks.
 - [Runtime API](docs/api.md): trusted host commands, native conversations, Reports, and authorized recall.
 - [Evidence](docs/research/evidence.md): original design, pinned prototype, and verified pi API baseline.
 - [Implementation plan](docs/superpowers/plans/2026-11-02-super-durable-agent.md): issue/PR split and acceptance tests.

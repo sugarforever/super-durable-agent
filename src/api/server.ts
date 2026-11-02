@@ -246,6 +246,9 @@ export async function startManagementServer(
               ticketId: j.ticketId,
               epoch: j.epoch,
               status: j.status,
+              commandDigest: j.commandDigest,
+              environmentId: j.environmentId,
+              receiptStatus: j.receipt?.status,
             })),
           };
         } else if (ticketMatch) {

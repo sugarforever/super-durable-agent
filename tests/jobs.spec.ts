@@ -394,3 +394,27 @@ it('verifies legacy prepared descriptors against the canonical repository withou
   expect(await readFile(descriptorPath, 'utf8')).toBe(canonicalJson(receipt));
   expect(await readFile(markerPath, 'utf8')).toBe(canonicalJson(receipt));
 });
+
+describe('Ticket workspace continuity',()=>{
+ it('preserves commits and dirty files across fresh Assignment authority and fences old leases',async()=>{
+   const f=await repo({trustedLocalShell:true});
+   await writeFile(join(f.prepared.cwd,'source.txt'),'committed work');
+   await run('git',['-C',f.prepared.cwd,'add','source.txt']);
+   await run('git',['-C',f.prepared.cwd,'commit','-m','worker change']);
+   const head=(await run('git',['-C',f.prepared.cwd,'rev-parse','HEAD'])).stdout.trim();
+   await writeFile(join(f.prepared.cwd,'dirty.txt'),'unsaved work');
+   const next={...identity,assignmentId:'resumed',epoch:2,mandateId:'fresh'};
+   f.configuration.authorize=async(i:any)=>({...i,capabilities:['repo.read','repo.write','command.execute']});
+   const payload={kind:'prepare' as const};
+   const prepared=await f.broker.prepare({operationId:'prepare-next',identity:next,payload,payloadDigest:operationDigest(next,payload)});
+   expect(prepared.cwd).toBe(f.prepared.cwd);
+   expect(prepared.environmentId).not.toBe(f.prepared.environmentId);
+   expect((await run('git',['-C',prepared.cwd,'rev-parse','HEAD'])).stdout.trim()).toBe(head);
+   expect(await readFile(join(prepared.cwd,'dirty.txt'),'utf8')).toBe('unsaved work');
+   await expect(f.broker.release(f.prepared.environmentId,'old-release')).rejects.toThrow();
+   await expect(f.broker.execute(f.request('old-write',{kind:'write',path:'dirty.txt',text:'bad'}))).rejects.toThrow();
+   expect(await f.broker.query('prepare')).toEqual(f.prepared);
+   const p={kind:'write' as const,environmentId:prepared.environmentId,path:'fresh.txt',text:'new authority'};
+   expect(await f.broker.execute({operationId:'fresh-write',identity:next,payload:p,payloadDigest:operationDigest(next,p)})).toMatchObject({status:'completed'});
+ });
+});

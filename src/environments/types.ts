@@ -22,6 +22,8 @@ export interface PreparedReceipt extends ReceiptIdentity {
   status: 'prepared'; environmentId: string; cwd: string; baseCommit: string;
   /** Present on new receipts; legacy receipts are verified through their environment hash and real git state. */
   repository?: string; gitCommonDirectory?: string;
+  /** Physical worktree remains Ticket-specific while each epoch has its own lease. */
+  workspaceId?: string;
 }
 export type ExecutionResult = { text: string; truncated: boolean } | { bytes: number } |
   { stdout: string; stderr: string; truncated: boolean; exitCode: number | null; signal: string | null };
@@ -42,6 +44,6 @@ export interface EnvironmentBroker {
   prepare(request: PrepareRequest): Promise<PreparedReceipt>;
   execute(request: ExecuteRequest): Promise<ExecutionReceipt>;
   query(operationId: string): Promise<BrokerReceipt | undefined>;
-  cancel(operationId: string, epoch: number): Promise<ExecutionReceipt>;
+  cancel(operationId: string, epoch: number, target?: ExecuteRequest): Promise<ExecutionReceipt>;
   release(environmentId: string, operationId: string): Promise<LifecycleReceipt>;
 }

@@ -114,3 +114,16 @@ export function configuredFeishu(value: unknown): FeishuSource | undefined {
     ...(accessTokenProvider ? { accessTokenProvider } : {}),
   } as any);
 }
+
+export function configuredPrincipals(value:unknown):import('../api/server.js').ManagementPrincipal[] | undefined {
+  if(value===undefined) return;
+  if(!Array.isArray(value)||!value.length||value.length>32) throw Error('Invalid management principals');
+  const principals=value.map(item=>{
+    const p=configObject(item,['id','role','tokenEnv','allowPause'],'management principal');
+    if(typeof p.id!=='string'||!p.id.trim()||!['operator','viewer','watchdog'].includes(p.role)||
+      p.allowPause!==undefined&&typeof p.allowPause!=='boolean') throw Error('Invalid management principal');
+    return {id:p.id,role:p.role,token:envSecret(p.tokenEnv),...(p.allowPause===undefined?{}:{allowPause:p.allowPause})};
+  });
+  if(new Set(principals.map(p=>p.id)).size!==principals.length||new Set(principals.map(p=>p.token)).size!==principals.length) throw Error('Duplicate management principal');
+  return principals;
+}

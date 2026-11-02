@@ -64,6 +64,7 @@ async function fixture(mode: "http" | "poll" = "http", timeoutMs = 3000) {
   const daemon = new RemoteDaemon(daemonOptions);
   let server: Awaited<ReturnType<typeof startDaemonServer>> | undefined;
   let polling: Awaited<ReturnType<typeof runDaemonPolling>> | undefined;
+  let resumePolling: (() => Promise<void>) | undefined;
   const broker = new RemoteEnvironmentBroker({
     endpointId: "device",
     token: "daemon-token",
@@ -102,12 +103,15 @@ async function fixture(mode: "http" | "poll" = "http", timeoutMs = 3000) {
           control.closeAllConnections();
         }),
     );
-    polling = await runDaemonPolling(daemon, {
-      url: `http://127.0.0.1:${address.port}`,
-      token: "daemon-token",
-      allowInsecureLoopback: true,
-      intervalMs: 10,
-    });
+    resumePolling = async () => {
+      polling = await runDaemonPolling(daemon, {
+        url: `http://127.0.0.1:${address.port}`,
+        token: "daemon-token",
+        allowInsecureLoopback: true,
+        intervalMs: 10,
+      });
+    };
+    await resumePolling();
     cleanup.push(() => polling!.close());
   }
   const prepare = {
@@ -128,6 +132,8 @@ async function fixture(mode: "http" | "poll" = "http", timeoutMs = 3000) {
     };
   };
   return {
+    pausePolling: () => polling!.close(),
+    resumePolling: () => resumePolling!(),
     root,
     daemon,
     daemonOptions,
@@ -801,3 +807,485 @@ for (const mode of ["http", "poll"] as const) {
     expect((await f.r.readTicket<any>(f.ticket.id)).lifecycle).toBe("stopped");
   });
 }
+
+describe("pre-admission operation cancellation", () => {
+  it("poll: cancels eight queued commands before any daemon admission and keeps the epoch usable", async () => {
+    const f = await fixture("poll", 30);
+    await f.pausePolling();
+    for (let n = 0; n < 8; n++) {
+      await f.broker.execute(
+        f.request(`queued-${n}`, {
+          kind: "shell",
+          command: "printf x >> forbidden",
+        }),
+      );
+      await f.broker.cancel(`queued-${n}`, identity.epoch);
+    }
+    for (let n = 0; n < 8; n++)
+      expect(await f.broker.query(`queued-${n}`)).toMatchObject({
+        status: "cancelled",
+      });
+    await f.resumePolling();
+    const deadline = Date.now() + 4000;
+    while (
+      (await f.daemon.broker.query("queued-7"))?.status !== "cancelled" &&
+      Date.now() < deadline
+    )
+      await delay(10);
+    expect(await f.daemon.broker.query("queued-7")).toMatchObject({
+      status: "cancelled",
+    });
+    // Delayed already-captured envelopes also hit the durable daemon tombstone.
+    for (let n = 0; n < 8; n++) {
+      const target = f.request(`queued-${n}`, {
+        kind: "shell",
+        command: "printf x >> forbidden",
+      });
+      await f.daemon.dispatch("cancel", {
+        operationId: `transport-cancel:queued-${n}:1`,
+        targetOperationId: target.operationId,
+        epoch: 1,
+        target,
+      });
+      expect(await f.daemon.dispatch("execute", target)).toMatchObject({
+        status: "cancelled",
+      });
+    }
+    await expect(readFile(join(f.prepared.cwd, "forbidden"))).rejects.toThrow();
+    expect(
+      await f.daemon.dispatch(
+        "execute",
+        f.request("other", { kind: "write", path: "allowed", text: "yes" }),
+      ),
+    ).toMatchObject({ status: "completed" });
+  });
+  it("http: a cancel arriving before the delayed execute fences only its exact immutable payload", async () => {
+    const f = await fixture("http");
+    const target = f.request("delayed", {
+      kind: "shell",
+      command: "printf bad > forbidden",
+    });
+    expect(
+      await f.daemon.dispatch("cancel", {
+        operationId: "cancel-delayed",
+        targetOperationId: target.operationId,
+        epoch: 1,
+        target,
+      }),
+    ).toMatchObject({ status: "cancelled" });
+    expect(await f.broker.execute(target)).toMatchObject({
+      status: "cancelled",
+    });
+    await expect(readFile(join(f.prepared.cwd, "forbidden"))).rejects.toThrow();
+    await expect(
+      f.daemon.dispatch(
+        "execute",
+        f.request("delayed", { kind: "shell", command: "echo changed" }),
+      ),
+    ).rejects.toThrow(/conflict/i);
+    expect(
+      await f.broker.execute(
+        f.request("unrelated", { kind: "write", path: "good", text: "ok" }),
+      ),
+    ).toMatchObject({ status: "completed" });
+  });
+});
+
+it("controlled full stack: Router, two Workers, Git workspace, followup, long/queued stop_job, restart, Outbox and PR closure", async () => {
+  const { openSuperAgent } = await import("../src/runtime/open.js");
+  const { createModels } = await import("@earendil-works/pi-ai/models");
+  const { fauxProvider, fauxAssistantMessage, fauxToolCall } =
+    await import("@earendil-works/pi-ai/providers/faux");
+  const { GitHubSource } = await import("../src/sources/github.js");
+  const { createHmac } = await import("node:crypto");
+  const { isRouter } = await import("./helpers/scheduling.js");
+  const f = await fixture("poll", 3000);
+  const comments: any[] = [];
+  const api = createServer(async (req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.method === "POST") {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      const value = {
+        id: comments.length + 1,
+        ...JSON.parse(Buffer.concat(chunks).toString()),
+      };
+      comments.push(value);
+      res.end(JSON.stringify(value));
+    } else res.end(JSON.stringify(comments));
+  });
+  await new Promise<void>((r) => api.listen(0, "127.0.0.1", r));
+  cleanup.push(() => new Promise<void>((r) => api.close(() => r())));
+  const github = new GitHubSource({
+    repositories: ["acme/repo"],
+    webhookSecret: "fixture",
+    apiToken: "fixture",
+    apiBase: `http://127.0.0.1:${(api.address() as any).port}`,
+    ownLogins: ["robot"],
+    addressed: true,
+  });
+  cleanup.push(async () => github.close());
+  const faux = fauxProvider(),
+    models = createModels();
+  models.setProvider(faux.provider);
+  const model = {
+    provider: faux.getModel().provider,
+    modelId: faux.getModel().id,
+  };
+  const directory = join(f.root, "e2e-runtime");
+  let r = await openSuperAgent({
+    directory,
+    startPaused: true,
+    models,
+    model,
+    environment: { broker: f.broker },
+    outbox: { adapters: [github] },
+  });
+  cleanup.push(() => r.close());
+  f.daemonOptions.authorize = (identity, action) =>
+    r.agents!.jobs.authorize(identity, action);
+  const operator = {
+    id: "github:alice",
+    kind: "human" as const,
+    trusted: true,
+  };
+  await r.updatePolicy(
+    {
+      version: 1,
+      acceptMode: "auto",
+      allowedActors: [operator.id],
+      botActors: [],
+      explicitCapabilities: [
+        "repo.read",
+        "repo.write",
+        "command.execute",
+        "channel.reply",
+        "pr.create",
+      ],
+      rules: [],
+    },
+    operator,
+    { commandId: "p" },
+  );
+  await github.configure(r);
+  const issued = new Set<string>(),
+    stops = new Set<string>();
+  const wait = async (predicate: () => Promise<boolean>) => {
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      if (await predicate()) return;
+      await delay(5);
+    }
+    throw Error(
+      "Full-stack condition did not settle " +
+        JSON.stringify({
+          jobs: (await r.list<any>("job")).map((j) => ({
+            status: j.status,
+            epoch: j.epoch,
+          })),
+          tickets: (await r.list<any>("ticket")).map((t) => ({
+            lifecycle: t.lifecycle,
+            epoch: t.assignmentEpoch,
+          })),
+        }),
+    );
+  };
+  const response = async (ctx: any) => {
+    const user = ctx.messages.filter((m: any) => m.role === "user").at(-1);
+    let input: any;
+    try {
+      input = JSON.parse(
+        typeof user?.content === "string" ? user.content : user.content[0].text,
+      );
+    } catch {
+      return fauxAssistantMessage("No input");
+    }
+    if (isRouter(ctx))
+      return ctx.messages.at(-1)?.role === "user" && input.candidates?.length
+        ? fauxAssistantMessage(
+            fauxToolCall("decide_batch", {
+              decisions: input.candidates.map((c: any) => ({
+                evalId: c.id,
+                epoch: c.epoch,
+                outcome: { kind: "accept", goal: `Task ${c.id}`, ruleIds: [] },
+              })),
+            }),
+            { stopReason: "toolUse" },
+          )
+        : fauxAssistantMessage("Routed");
+    if (!input.inputId) return fauxAssistantMessage("Waiting");
+    const body = String(input.body ?? "");
+    let command: string | undefined;
+    if (body.includes("primary-work"))
+      command =
+        "printf committed > code; git add code; git commit -m worker; printf dirty > dirty";
+    else if (body.includes("long-work"))
+      command = `printf begun > '${join(f.root, "e2e-begun")}'; sleep 20`;
+    else if (body.includes("queued-work"))
+      command = "printf forbidden > forbidden";
+    else if (body.includes("resume-work") || body.includes("retry-work"))
+      command =
+        'test "$(cat code)" = committed && test "$(cat dirty)" = dirty && printf preserved > resumed';
+    if (command && !issued.has(input.inputId)) {
+      issued.add(input.inputId);
+      return fauxAssistantMessage(
+        fauxToolCall("start_job", {
+          assignmentId: input.assignmentId,
+          epoch: input.epoch,
+          command,
+        }),
+        { stopReason: "toolUse" },
+      );
+    }
+    if (
+      (body.includes("queued-work") || body.includes("stop-long")) &&
+      !stops.has(input.inputId)
+    ) {
+      await wait(async () => {
+        const jobs = await r.list<any>("job");
+        return jobs.some((j) =>
+          body.includes("queued-work")
+            ? j.action.command === "printf forbidden > forbidden" &&
+              !!j.payloadDigest
+            : j.action.command.includes("e2e-begun"),
+        );
+      });
+      if (body.includes("queued-work"))
+        await wait(async () => f.broker.diagnostics().queued > 0);
+      const job = (await r.list<any>("job")).find((j) =>
+        body.includes("queued-work")
+          ? j.action.command === "printf forbidden > forbidden"
+          : j.action.command.includes("e2e-begun"),
+      );
+      stops.add(input.inputId);
+      return fauxAssistantMessage(fauxToolCall("stop_job", { jobId: job.id }), {
+        stopReason: "toolUse",
+      });
+    }
+    if (
+      ctx.messages.at(-1)?.role === "toolResult" &&
+      ctx.messages.at(-1)?.toolName === "report"
+    )
+      return fauxAssistantMessage("Report recorded");
+    if (
+      ctx.messages.at(-1)?.role !== "user" &&
+      ctx.messages.some(
+        (m: any) =>
+          m.role === "toolResult" &&
+          m.toolName === "report" &&
+          JSON.stringify(m).includes(input.inputId),
+      )
+    )
+      return fauxAssistantMessage("Done");
+    return fauxAssistantMessage(
+      fauxToolCall("report", {
+        reportId: `e2e:${input.inputId}`,
+        assignmentId: input.assignmentId,
+        epoch: input.epoch,
+        inputIds: [input.inputId],
+        status: "ready",
+        content: { summary: "Controlled result" },
+      }),
+      { stopReason: "toolUse" },
+    );
+  };
+  faux.setResponses(Array.from({ length: 500 }, () => response));
+  let delivery = 0;
+  async function webhook(number: number, body: string, action = "opened") {
+    const raw = Buffer.from(
+      JSON.stringify({
+        action,
+        repository: { full_name: "acme/repo" },
+        sender: { login: "alice", type: "User" },
+        pull_request: {
+          id: number,
+          number,
+          state: action === "closed" ? "closed" : "open",
+          merged: action === "closed",
+          title: "Fixture",
+          body,
+          updated_at: new Date(1800000000000 + ++delivery * 1000).toISOString(),
+        },
+      }),
+    );
+    return github.webhook(r, raw, {
+      "x-github-event": "pull_request",
+      "x-github-delivery": `e2e-${delivery}`,
+      "x-hub-signature-256":
+        "sha256=" + createHmac("sha256", "fixture").update(raw).digest("hex"),
+    });
+  }
+  await r.activate();
+  await webhook(1, "primary-work");
+  await webhook(2, "secondary-work");
+  await wait(
+    async () =>
+      (await r.list<any>("ticket")).length === 2 &&
+      (await r.list<any>("job")).some((j) => j.status === "completed"),
+  );
+  await r.agents!.waitForIdle();
+  const ticket =
+    (await r.list<any>("ticket")).find((t) =>
+      (t.latestReport as any)?.inputIds.some((id: string) => issued.has(id)),
+    ) ?? (await r.list<any>("ticket"))[0];
+  const first = (await r.list<any>("job")).find((j) =>
+    j.action.command.includes("git commit"),
+  );
+  const firstTicket = await r.readTicket<any>(first.ticketId);
+  const worker = firstTicket.workerConversationId;
+  expect(
+    new Set((await r.list<any>("ticket")).map((t) => t.workerConversationId))
+      .size,
+  ).toBe(2);
+  const prepared = (await f.daemon.broker.query(
+    first.preparationOperationId,
+  )) as any;
+  const workHead = (
+    await git("git", ["-C", prepared.cwd, "rev-parse", "HEAD"])
+  ).stdout.trim();
+  expect(
+    (
+      await git("git", ["-C", prepared.cwd, "log", "-1", "--pretty=%s"])
+    ).stdout.trim(),
+  ).toBe("worker");
+  expect(await readFile(join(prepared.cwd, "dirty"), "utf8")).toBe("dirty");
+  await webhook(1, "long-work", "synchronize");
+  await wait(async () =>
+    readFile(join(f.root, "e2e-begun"), "utf8").then(
+      (x) => x === "begun",
+      () => false,
+    ),
+  );
+  await webhook(1, "stop-long", "synchronize");
+  await wait(
+    async () =>
+      (await r.list<any>("job")).find((j) =>
+        j.action.command.includes("e2e-begun"),
+      )?.status === "cancelled",
+  );
+  await r.agents!.waitForIdle();
+  await f.pausePolling();
+  await webhook(1, "queued-work", "synchronize");
+  await wait(
+    async () =>
+      (await r.list<any>("job")).find(
+        (j) => j.action.command === "printf forbidden > forbidden",
+      )?.status === "cancelled",
+  );
+  await f.resumePolling();
+  await r.agents!.waitForIdle();
+  const queued = (await r.list<any>("job")).find(
+    (j) => j.action.command === "printf forbidden > forbidden",
+  );
+  await wait(
+    async () =>
+      (await f.daemon.broker.query(queued.operationId))?.status === "cancelled",
+  );
+  await expect(readFile(join(prepared.cwd, "forbidden"))).rejects.toThrow();
+  const before = comments.length;
+  await r.close();
+  r = await openSuperAgent({
+    directory,
+    startPaused: true,
+    models,
+    model,
+    environment: { broker: f.broker },
+    outbox: { adapters: [github] },
+  });
+  await r.activate();
+  await r.agents!.waitForIdle();
+  expect(comments.length).toBe(before);
+  await github.trackPullRequest(r, first.ticketId, "acme/repo#1", {
+    commandId: "track",
+  });
+  await webhook(1, "completed", "closed");
+  await r.agents!.waitForIdle();
+  await wait(
+    async () => (await r.readTicket<any>(first.ticketId)).lifecycle === "ended",
+  );
+  await webhook(1, "resume-work", "reopened");
+  await wait(async () =>
+    (await r.list<any>("job")).some(
+      (j) => j.epoch > 1 && j.status === "completed",
+    ),
+  );
+  await r.agents!.waitForIdle();
+  const resumed = (await r.list<any>("job")).find((j) => j.epoch > 1);
+  const retained = (await f.daemon.broker.query(
+    resumed.preparationOperationId,
+  )) as any;
+  expect(retained.cwd).toBe(prepared.cwd);
+  expect(
+    (await git("git", ["-C", prepared.cwd, "rev-parse", "HEAD"])).stdout.trim(),
+  ).toBe(workHead);
+  expect((await r.readTicket<any>(first.ticketId)).workerConversationId).toBe(
+    worker,
+  );
+  expect(await readFile(join(prepared.cwd, "resumed"), "utf8")).toBe(
+    "preserved",
+  );
+  await r.stopTicket(first.ticketId, operator, { commandId: "explicit-stop" });
+  await r.agents!.waitForIdle();
+  await r.retryTicket(first.ticketId, operator, {
+    commandId: "explicit-retry",
+  });
+  await webhook(1, "retry-work", "synchronize");
+  await wait(async () =>
+    (await r.list<any>("job")).some(
+      (j) => j.epoch > resumed.epoch && j.status === "completed",
+    ),
+  );
+  await r.agents!.waitForIdle();
+  expect(await readFile(join(prepared.cwd, "dirty"), "utf8")).toBe("dirty");
+  expect(
+    (await r.list<any>("outbox")).every((m) =>
+      ["sent", "invalid"].includes(m.status),
+    ),
+  ).toBe(true);
+  expect(comments.length).toBeGreaterThan(2);
+}, 30000);
+it("HTTP per-operation cancellation fences an execute suspended in its async authority lookup", async () => {
+  const f = await fixture("http");
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>((r) => (enter = r)),
+    gate = new Promise<void>((r) => (release = r));
+  const authorize = f.daemonOptions.authorize;
+  let hold = true;
+  f.daemonOptions.authorize = async (i, action) => {
+    if (action === "execute" && hold) {
+      enter();
+      await gate;
+    }
+    return authorize(i);
+  };
+  const request = f.request("barrier-cancel", {
+    kind: "shell",
+    command: "printf forbidden > forbidden",
+  });
+  const execution = f.broker.execute(request);
+  await entered;
+  const cancellation = f.broker.cancel(request.operationId, identity.epoch);
+  try {
+    const deadline = Date.now() + 3000;
+    while (
+      (await f.daemon.broker.query(request.operationId))?.status !==
+        "cancelled" &&
+      Date.now() < deadline
+    )
+      await delay(5);
+    expect(await f.daemon.broker.query(request.operationId)).toMatchObject({
+      status: "cancelled",
+    });
+  } finally {
+    hold = false;
+    release();
+  }
+  expect(await execution).toMatchObject({ status: "cancelled" });
+  expect(await cancellation).toMatchObject({ status: "cancelled" });
+  await expect(readFile(join(f.prepared.cwd, "forbidden"))).rejects.toThrow();
+  expect(
+    await f.broker.execute(
+      f.request("after-barrier", { kind: "write", path: "safe", text: "yes" }),
+    ),
+  ).toMatchObject({ status: "completed" });
+});

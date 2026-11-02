@@ -54,7 +54,7 @@ const report = {
 await runtime.agents.report(workerConversationId, report);
 ```
 
-This checkpoint accepts only waiting, ready, and attention. The full progress/waiting/ready/blocked/failed/dropped and typed question lifecycle remains required in the following scheduler/Report checkpoint before Outbox or lifecycle consumers depend on it. This subset does not release Job reservations. Ready is a structured reviewable result, not automatic PR acceptance or Ticket completion. Plain final prose without a report requires attention and leaves input consumption outstanding.
+Reports accept progress, waiting, ready, blocked, failed, dropped, and attention, with typed questions and an explicit waitingFor reason. Questions normalize to waiting for human input. Job reservations remain governed by durable Job accounting. Ready is a structured reviewable result, not automatic PR acceptance or Ticket completion. Plain final prose without a report requires attention and leaves input consumption outstanding.
 
 ## Artifact recall
 
@@ -97,3 +97,9 @@ Structured ready Reports enqueue answers, questions enqueue questions, and block
 Native sender Tasks are finite. Durable nextAttemptAt and attempt count survive restart; reconciliation dispatches due work, while a host timer only wakes it. Known no-send failures or authoritative absence can retry the same immutable key, with jittered backoff from 2 seconds to a 60-second cap and at most eight attempts. Generic network errors are uncertain until receipt lookup establishes otherwise. Stop fences queued sends; an already-started send may still complete and its receipt remains auditable.
 
 `runtime.outbox.inspectReceipt(id)` only queries and records a found receipt, including after stop. Absent/unknown never triggers another effect or fresh Ticket progress. A found receipt for the exact current open assignment can resolve its matching Outbox-only uncertain diagnostic and recheck natural completion after authenticated closure; stopped or old-epoch receipt repair remains accounting-only. Retain unresolved uncertain messages for inspection; do not replace their keys to force a retry.
+
+## Startup compatibility and migrations
+
+Trusted hosts may supply `extensions` and explicitly set `allowTaskMigrations: true` to install compatible durable Task upgrades. Startup scans all live Task definitions and versions before resuming scheduling. A version upgrade requires its registered native `TaskDefinition.migrate`; the pure migration is validated before pi performs the persisted migration at reservation. The callback may run more than once, so it must not perform external effects. Stable operation identities protect resumed execution, not callback invocation count.
+
+Document compatibility is a separate startup gate across session, conversation, and Task scopes. Unsupported Document kinds or versions fail closed. Task migration permission does not authorize a Document schema rewrite. Stop the service and take a verified backup before changing definitions.
