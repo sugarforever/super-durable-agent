@@ -45,6 +45,7 @@ export class PolicyController {
         ruleIds.add(rule.id); for (const capability of rule.capabilities) nonempty(capability, 'capability');
       }
       await this.store.put(tx, 'policy', 'current', policy);
+      await this.store.put(tx, 'policyRevision', String(policy.version), policy);
       for (const ticket of await this.store.listInTransaction<Ticket>(tx, 'ticket')) {
         if (ticket.lifecycle !== 'open') continue;
         const id = this.id('policyNotice', ticket.id, String(policy.version));
@@ -244,7 +245,7 @@ export class PolicyController {
       } else if (recorded.kind === 'accept') {
         const ticketId = this.id('ticket', decisionId), mandateId = this.id('mandate', decisionId), assignmentId = this.id('assignment', ticketId, '1');
         const capabilities = [...new Set(recorded.capabilities ?? (evaluation.basis === 'explicit' ? policy.explicitCapabilities ?? defaultExplicitCapabilities : policy.rules.filter(rule => recorded.ruleIds.includes(rule.id)).flatMap(rule => rule.capabilities)))];
-        const mandate: Mandate = { id: mandateId, actor: evaluation.actor, basis: evaluation.basis, policyVersion: policy.version, ruleIds: [...new Set(recorded.ruleIds)], capabilities, sourceId: trigger.sourceId, scope: threads, withdrawnAt: null };
+        const mandate: Mandate = { id: mandateId, actor: evaluation.actor, basis: evaluation.basis, policyVersion: policy.version, ruleIds: [...new Set(recorded.ruleIds)], capabilities, rulesSnapshot: policy.rules.filter(rule => recorded.ruleIds.includes(rule.id)), sourceId: trigger.sourceId, scope: threads, withdrawnAt: null };
         const ticket: Ticket = { id: ticketId, goal: recorded.goal, mandateId, lifecycle: 'open', revision: 1, assignmentId, assignmentEpoch: 1 };
         await this.store.put(tx, 'mandate', mandateId, mandate);
         await this.store.put(tx, 'ticket', ticketId, ticket);
@@ -426,10 +427,11 @@ export class PolicyController {
     const id = this.id('delivery', ticket.id, triggerId, String(ticket.assignmentEpoch));
     const previous = await this.store.get<DeliveryIntent>(tx, 'delivery', id);
     if (previous) {
-      if (own && !previous.own && previous.status === 'pending') await this.store.put(tx, 'delivery', id, { ...previous, own: true, resume: ticket.lifecycle === 'open' });
-      if (own && !previous.own && previous.status === 'delivered') {
+      const frozen = await this.store.get(tx, 'deliveryRun', id);
+      if (own && !previous.own && previous.status === 'pending' && !frozen) await this.store.put(tx, 'delivery', id, { ...previous, own: true, resume: ticket.lifecycle === 'open' });
+      if (own && !previous.own && (previous.status === 'delivered' || frozen)) {
         const ownershipId = this.id('delivery', ticket.id, triggerId, String(ticket.assignmentEpoch), 'ownership');
-        if (!await this.store.get<DeliveryIntent>(tx, 'delivery', ownershipId)) await this.store.put(tx, 'delivery', ownershipId, { ...previous, id: ownershipId, own: true, resume: ticket.lifecycle === 'open', status: 'pending' });
+        if (!await this.store.get<DeliveryIntent>(tx, 'delivery', ownershipId)) await this.store.put(tx, 'delivery', ownershipId, { ...previous, id: ownershipId, ownershipOf: previous.id, own: true, resume: ticket.lifecycle === 'open', status: 'pending' });
       }
       return;
     }

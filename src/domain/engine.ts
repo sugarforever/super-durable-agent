@@ -87,9 +87,16 @@ export class Engine {
     });
   }
 
+  private async prepareNormalized(clean: NormalizedEvent): Promise<PreparedEvent> {
+    const { receivedAt: _receivedAt, ...stablePayload } = clean;
+    const originalDigest = digest(stablePayload);
+    const prepared = this.prepareEvent ? await this.prepareEvent(clean) : clean;
+    return { ...prepared, originalDigest };
+  }
+
   async receive(event: NormalizedEvent): Promise<ReceiveResult> {
     const clean = normalizeEvent(event);
-    const normalized = this.prepareEvent ? await this.prepareEvent(clean) : clean;
+    const normalized = await this.prepareNormalized(clean);
     try { return await this.transaction((tx) => this.receiveInTransaction(tx, normalized)); }
     catch (error) {
       if (error instanceof PendingCapacity) return { disposition: 'backpressure', retryable: true };
@@ -104,7 +111,7 @@ export class Engine {
     digest(cursor.value);
     const normalized = await Promise.all(events.map(async event => {
       const clean = normalizeEvent(event);
-      return this.prepareEvent ? this.prepareEvent(clean) : clean;
+      return this.prepareNormalized(clean);
     }));
     try {
       return await this.transaction(async (tx) => {
@@ -123,11 +130,13 @@ export class Engine {
 
   async receiveInTransaction(tx: Tx, event: PreparedEvent): Promise<ReceiveResult> {
     const id = scopedId(this.instanceId, 'trigger', [event.sourceId, event.externalId, event.revision]);
-    const { receivedAt: _receivedAt, ...stablePayload } = event;
-    const hash = digest(stablePayload);
+    const { originalDigest, ...storedEvent } = event;
+    const { receivedAt: _receivedAt, ...stablePayload } = storedEvent;
+    const storageDigest = digest(stablePayload);
+    const hash = originalDigest ?? storageDigest;
     const existing = await this.store.get<Trigger>(tx, 'trigger', id);
     if (existing) {
-      if (existing.digest !== hash) throw new Error(`Event payload conflict: ${id}`);
+      if (existing.digest !== hash && existing.digest !== storageDigest) throw new Error(`Event payload conflict: ${id}`);
       return { disposition: 'duplicate', triggerId: id };
     }
     const source = await this.store.get<Source>(tx, 'source', event.sourceId);
@@ -137,7 +146,7 @@ export class Engine {
     const state = await this.store.get<IntakeState>(tx, 'state', 'intake') ?? { count: 0, lastOrdinal: 0 };
     if (state.count >= this.maxPending) throw new PendingCapacity('Pending intake capacity exceeded');
     const ordinal = state.lastOrdinal + 1;
-    const trigger: Trigger = { ...event, id, ordinal, digest: hash };
+    const trigger: Trigger = { ...storedEvent, id, ordinal, digest: hash };
     await this.store.put(tx, 'trigger', id, trigger);
     const audit: AuditEvent = { id, kind: 'trigger.received', triggerId: id, occurredAt: event.receivedAt };
     await this.store.put(tx, 'audit', id, audit);

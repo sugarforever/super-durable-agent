@@ -32,7 +32,11 @@ Policy contains version, acceptMode, allowedActors, botActors, rules, and option
 - `noteWorker(routerConversationId, ticketId, text, id, mode?)` creates factual context without authority. Normal notes use followUp; trusted host corrections may select steer.
 - `decideBatch(routerConversationId, decisions, callId?)` returns independent success/error outcomes for each item.
 
-Native admission, placement, application consumption, and settlement are distinct. Delivery records freeze the exact prompt, digest, requestId, mode, and input ID before submit. After a crash at admission, repeat the same requestId. Intentional bounded retries after terminal failure have separate persisted attempt identities. A durable redrive boundary can recover stranded native inbox items without readmitting the original queued input.
+Native admission, placement, application consumption, and settlement are distinct. Delivery records freeze the exact prompt, digest, requestId, mode, and input ID before submit. After a crash at admission, repeat the same requestId. Intentional bounded retries after terminal failure have separate persisted attempt identities. A durable redrive boundary can recover stranded native inbox items without readmitting the original queued input. Recovery reads native task identities on the transaction line; input admission and settlement compare task, attempt, request, and submission identities. Cancel and redrive claims also retry terminal/missing native tasks within three attempts, then record attention. Exhausted redrives withdraw queued input through a finite native cleanup task.
+
+A context input's ownership semantics freeze with its prompt. Attaching that Trigger after freezing creates a separate ownership-transition input referencing the earlier input; consuming the earlier context cannot acknowledge the new ownership. A promotion racing outside-commit prompt preparation is re-drafted before the claim commits.
+
+Router batch context includes bounded trusted Policy/rule summaries and a Ticket index, with authorized references for full paged discovery. Workers receive their frozen Mandate, source/scope/capability ceiling, matched-rule instructions, and source metadata. Delivery prompts distinguish `routingEpoch` for handback from the Assignment `epoch` for Reports. New Mandates persist matched-rule snapshots; legacy grants without recoverable historical rules explicitly expose that the old instructions are unavailable rather than substituting current authority.
 
 ## Structured reports
 
@@ -50,13 +54,13 @@ const report = {
 await runtime.agents.report(workerConversationId, report);
 ```
 
-The native layer initially accepts waiting, ready, and attention. Later lifecycle checkpoints extend outcome handling. Ready is a structured reviewable result, not automatic PR acceptance or Ticket completion. Plain final prose without a report requires attention and leaves input consumption outstanding.
+This checkpoint accepts only waiting, ready, and attention. The full progress/waiting/ready/blocked/failed/dropped and typed question lifecycle remains required in the following scheduler/Report checkpoint before Outbox or lifecycle consumers depend on it. This subset does not release Job reservations. Ready is a structured reviewable result, not automatic PR acceptance or Ticket completion. Plain final prose without a report requires attention and leaves input consumption outstanding.
 
 ## Artifact recall
 
-`agents.recall(conversationId, ref, cursor?)` returns text, estimatedTokens, and an optional next cursor. References are Trigger, delivery-run, note, or Report receipt IDs, or `ticket:<id>`. Naked content digests and source-supplied pointers do not grant access. Every page rechecks the role and Ticket scope.
+`agents.recall(conversationId, ref, cursor?)` returns text, estimatedTokens, and an optional next cursor. References are Trigger, delivery-run, note, or Report receipt IDs, or `ticket:<id>`. Trusted context routes are `trigger_context:<triggerId>`, `ticket_context:<ticketId>`, `worker_context:<ticketId>`, Router-only `policy:<version>`, and the Router-only `tickets` index. Full frozen Worker authority may itself spill and is recovered through its role-checked context reference. Naked content digests and source-supplied pointers do not grant access. Every page rechecks the role and Ticket scope.
 
-Artifacts spill above 16 KiB UTF-8, retaining a bounded excerpt and SHA-256 reference. Recall pages are limited to 2,000 UTF-16 units / 8,000 UTF-8 bytes without splitting surrogate pairs. The byte-based token estimate is conservative, not an exact tokenizer measurement. Include artifactRoot in backups; SQLite alone cannot restore spilled context.
+Artifacts spill above 16 KiB UTF-8, retaining a bounded excerpt and SHA-256 reference. Complete unique temporary files are atomically renamed into digest paths; existing digest objects are verified and truncated legacy objects are repaired before a reference can commit. Event deduplication hashes the original normalized payload before spill, preserving duplicate replay of pre-spill full-body Triggers. Recall pages are limited to 2,000 UTF-16 units / 8,000 UTF-8 bytes without splitting surrogate pairs. The byte-based token estimate is conservative, not an exact tokenizer measurement. Include artifactRoot in backups; SQLite alone cannot restore spilled context.
 
 ## Execution authority
 

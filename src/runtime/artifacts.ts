@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, writeFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 /** Content-addressed UTF-8 bodies. IO always runs before/outside domain commits. */
@@ -12,14 +12,33 @@ export class Artifacts {
   async put(text: string): Promise<string> {
     const id = createHash("sha256").update(text).digest("hex");
     await mkdir(this.root, { recursive: true });
+    // A final object is only published after a unique temporary object is complete.
+    // Validate prior objects: older interrupted direct writes may be truncated.
     try {
-      await writeFile(join(this.root, id), text, {
+      await this.get(id);
+      return id;
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code !== "ENOENT" &&
+        !(
+          error instanceof Error && error.message === "Artifact digest mismatch"
+        )
+      )
+        throw error;
+    }
+    const temporary = join(this.root, `.${id}.${randomUUID()}.tmp`);
+    try {
+      await writeFile(temporary, text, {
         encoding: "utf8",
         flag: "wx",
         mode: 0o600,
       });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      // Concurrent publishers have the same complete digest payload. rename atomically
+      // replaces a legacy partial object and never exposes our temporary contents.
+      await rename(temporary, join(this.root, id));
+      await this.get(id);
+    } finally {
+      await rm(temporary, { force: true });
     }
     return id;
   }

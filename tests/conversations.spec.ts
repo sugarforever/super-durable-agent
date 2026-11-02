@@ -950,4 +950,695 @@ describe("native Router, ownerless Workers and durable delivery", () => {
       admitted: false,
     });
   });
+  it("replays an unchanged pre-spill large event after upgrade and rejects forged source digests", async () => {
+    const { r, directory } = await setup();
+    const old = event("old-large", { body: "original body ".repeat(5000) });
+    r.engine.prepareEvent = undefined;
+    const first = await r.receive(old);
+    await r.close();
+    const reopened = await openSuperAgent({ directory });
+    runtimes.push(reopened);
+    expect(await reopened.receive({ ...old, receivedAt: 2000 })).toEqual({
+      disposition: "duplicate",
+      triggerId: first.triggerId,
+    });
+    const batch = await reopened.receiveBatch([old], {
+      sourceId: "cli",
+      value: "replayed-old-large",
+    });
+    expect(batch.disposition).toBe("stored");
+    const original = await reopened.engine.store.read(
+      "trigger",
+      first.triggerId,
+    );
+    await expect(
+      reopened.receive({
+        ...old,
+        body: "changed",
+        originalDigest: original.digest,
+        bodyArtifact: "a".repeat(64),
+      } as any),
+    ).rejects.toThrow(/conflict/i);
+  });
+  it("fences stale native inspection and late input settlement against a newer retry claim", async () => {
+    const { r, directory } = await setup();
+    await accept(r, "retry-race");
+    let entered!: () => void,
+      releaseFirst!: () => void,
+      releaseRetry!: () => void;
+    const firstEntered = new Promise<void>((resolve) => (entered = resolve)),
+      firstGate = new Promise<void>((resolve) => (releaseFirst = resolve)),
+      retryGate = new Promise<void>((resolve) => (releaseRetry = resolve));
+    let calls = 0;
+    const response = async () => {
+      if (++calls === 1) {
+        entered();
+        await firstGate;
+        return fauxAssistantMessage("", {
+          stopReason: "error",
+          errorMessage: "Controlled invalid request",
+        });
+      }
+      await retryGate;
+      return fauxAssistantMessage("waiting");
+    };
+    const { active } = await activate(
+      r,
+      directory,
+      Array.from({ length: 20 }, () => response),
+    );
+    await firstEntered;
+    const [original] = await active.list("deliveryRun");
+    let inspected!: () => void, releaseInspection!: () => void;
+    const captured = new Promise<void>((resolve) => (inspected = resolve)),
+      inspectionGate = new Promise<void>(
+        (resolve) => (releaseInspection = resolve),
+      );
+    const inspect = active.harness.inspect.bind(active.harness);
+    let intercept = true;
+    active.harness.inspect = async (...args: any[]) => {
+      const result = await inspect(...args);
+      if (intercept) {
+        intercept = false;
+        inspected();
+        await inspectionGate;
+      }
+      return result;
+    };
+    try {
+      const pumping = active.agents.pump();
+      await captured;
+      releaseFirst();
+      await until(
+        async () =>
+          (await active.engine.store.read("deliveryRun", original.id))
+            .attempt === 2,
+      );
+      releaseInspection();
+      await pumping;
+      const run = await active.engine.store.read("deliveryRun", original.id);
+      const tasks = (await inspect(active.engine.context)).tasks.filter(
+        (t: any) =>
+          t.record.kind === "sa.agentInput" && t.record.input.id === run.id,
+      );
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0].record.id).toBe(run.taskId);
+      expect(run.executionAttempts ?? 1).toBe(1);
+      const receipt = await (
+        await active.harness.submission(
+          original.submissionId,
+          active.engine.context,
+        )
+      ).status(active.engine.context);
+      await active.engine.transaction((tx: any) =>
+        active.agents.settleInTransaction(tx, "deliveryRun", run.id, receipt, {
+          taskId: original.taskId,
+          attempt: original.attempt,
+          requestId: original.requestId,
+          submissionId: original.submissionId,
+        }),
+      );
+      expect(await active.engine.store.read("deliveryRun", run.id)).toEqual(
+        run,
+      );
+    } finally {
+      releaseFirst();
+      releaseRetry();
+      releaseInspection();
+      active.harness.inspect = inspect;
+    }
+    await active.agents.waitForIdle();
+  });
+  it("delivers an explicit ownership transition when a reported context input is attached before settlement", async () => {
+    const { r, directory } = await setup();
+    const a = await accept(r, "owner");
+    await r.subscribe(a.id, "cli", "context-promotion", false, {
+      commandId: "follow-promotion",
+    });
+    const source = await r.receive(event("context-promotion"));
+    const candidate = (await r.listCandidates())[0];
+    let entered!: () => void, release!: () => void;
+    const reported = new Promise<void>((resolve) => (entered = resolve)),
+      gate = new Promise<void>((resolve) => (release = resolve));
+    let held = false;
+    const seen: any[] = [];
+    const response = async (ctx: any) => {
+      if (isRouter(ctx)) return fauxAssistantMessage("waiting");
+      const input = JSON.parse(userText(ctx));
+      if (input.triggerId !== source.triggerId)
+        return fauxAssistantMessage("waiting");
+      if (ctx.messages.at(-1).role === "user") {
+        seen.push(input);
+        return fauxAssistantMessage(
+          fauxToolCall("report", {
+            reportId: `report-${input.inputId}`,
+            assignmentId: input.assignmentId,
+            epoch: input.epoch,
+            inputIds: [input.inputId],
+            status: "waiting",
+            content: "Consumed presented semantics",
+          }),
+          { stopReason: "toolUse" },
+        );
+      }
+      if (!held) {
+        held = true;
+        entered();
+        await gate;
+      }
+      return fauxAssistantMessage("waiting");
+    };
+    const { active } = await activate(
+      r,
+      directory,
+      Array.from({ length: 30 }, () => response),
+    );
+    try {
+      await reported;
+      await active.decide(
+        candidate.id,
+        candidate.epoch,
+        { kind: "attach", ticketId: a.id },
+        { commandId: "attach-after-context-report" },
+      );
+      await active.agents.pump();
+      const runs = (await active.list("deliveryRun")).filter(
+        (d: any) => d.triggerId === source.triggerId,
+      );
+      expect(runs).toHaveLength(2);
+      expect(
+        runs.some(
+          (d: any) =>
+            JSON.parse(d.prompt).ownershipTransition === true &&
+            JSON.parse(d.prompt).own === true,
+        ),
+      ).toBe(true);
+    } finally {
+      release();
+    }
+    await active.agents.waitForIdle();
+    expect(seen.filter((i) => i.own === true)).toHaveLength(1);
+    expect(
+      await active.engine.store.read("disposition", source.triggerId),
+    ).toMatchObject({ consumedTicketIds: [a.id] });
+    expect(
+      await active.engine.store.read("intake", source.triggerId),
+    ).toMatchObject({ released: true });
+  });
+  it("lets the provider infer acceptance and discover coordination Tickets using only presented trusted authority", async () => {
+    const { r, directory } = await setup();
+    const existing = await accept(r, "existing coordination target");
+    await r.updatePolicy(
+      {
+        version: 2,
+        acceptMode: "auto",
+        allowedActors: ["alice"],
+        botActors: ["bot"],
+        rules: [
+          {
+            id: "unpredictable-rule-713",
+            enabled: true,
+            instructions:
+              "Maintain the project when a bot requests maintenance",
+            capabilities: ["repo.read"],
+          },
+        ],
+      },
+      alice,
+      { commandId: "discovery-policy" },
+    );
+    await r.receive(
+      event("inferred-maintenance", {
+        actor: { id: "bot", kind: "bot", trusted: true },
+        body: "New maintenance request",
+      }),
+    );
+    let discovered = false,
+      workerAuthority = false;
+    const response = async (ctx: any) => {
+      const input = JSON.parse(userText(ctx));
+      if (!isRouter(ctx)) {
+        if (input.authority?.mandate?.basis === "inferred") {
+          expect(input.authority.mandate.capabilities).toEqual(["repo.read"]);
+          expect(input.authority.matchedRules[0].instructions).toContain(
+            "Maintain the project",
+          );
+          expect(input.sourceId).toBe("cli");
+          expect(input.threads).toEqual(["inferred-maintenance"]);
+          expect(input.routingEpoch).toBe(1);
+          workerAuthority = true;
+        }
+        return fauxAssistantMessage("waiting");
+      }
+      if (ctx.messages.at(-1).role !== "user" || !input.candidates.length)
+        return fauxAssistantMessage("done");
+      expect(input.authority.acceptMode).toBe("auto");
+      const rule = input.authority.rules.find((rule: any) => rule.enabled);
+      const target = input.tickets.items.find((ticket: any) =>
+        ticket.goal.includes("coordination"),
+      );
+      expect(target).toBeDefined();
+      discovered = true;
+      const c = input.candidates[0];
+      return fauxAssistantMessage(
+        fauxToolCall("decide_batch", {
+          decisions: [
+            {
+              evalId: c.id,
+              epoch: c.epoch,
+              outcome: c.body.startsWith("Attach")
+                ? { kind: "attach", ticketId: target.id }
+                : {
+                    kind: "accept",
+                    goal: "inferred maintenance",
+                    ruleIds: [rule.id],
+                    capabilities: rule.capabilities,
+                  },
+            },
+          ],
+        }),
+        { stopReason: "toolUse" },
+      );
+    };
+    const { active } = await activate(
+      r,
+      directory,
+      Array.from({ length: 30 }, () => response),
+    );
+    await active.agents.waitForIdle();
+    expect(discovered).toBe(true);
+    expect(workerAuthority).toBe(true);
+    expect(
+      (await active.list("ticket")).some(
+        (t: any) => t.goal === "inferred maintenance",
+      ),
+    ).toBe(true);
+    const attached = await active.receive(
+      event("discovered-attach", {
+        body: "Attach this request to existing coordination target",
+      }),
+    );
+    await active.agents.waitForIdle();
+    expect(
+      (await active.engine.store.read("disposition", attached.triggerId))
+        .ownerTickets,
+    ).toContain(existing.id);
+  });
+  it("presents the Trigger routing epoch separately from assignment epoch for native handback", async () => {
+    const { r, directory } = await setup();
+    const a = await accept(r, "persistent-owner");
+    await r.subscribe(a.id, "cli", "epoch-source", false, {
+      commandId: "follow-epoch",
+    });
+    const source = await r.receive(event("epoch-source"));
+    let c = (await r.listCandidates())[0];
+    await r.decide(
+      c.id,
+      c.epoch,
+      { kind: "accept", goal: "temporary", ruleIds: [] },
+      { commandId: "temporary" },
+    );
+    const b = (await r.list("ticket")).find((t: any) => t.goal === "temporary");
+    await r.handback(b.id, source.triggerId, 1, "reroute", {
+      commandId: "reroute",
+    });
+    c = (await r.listCandidates())[0];
+    expect(c.epoch).toBe(2);
+    await r.decide(
+      c.id,
+      c.epoch,
+      { kind: "attach", ticketId: a.id },
+      { commandId: "attach-epoch2" },
+    );
+    let handedBack = false;
+    const response = async (ctx: any) => {
+      if (isRouter(ctx) || ctx.messages.at(-1).role !== "user")
+        return fauxAssistantMessage("waiting");
+      const input = JSON.parse(userText(ctx));
+      if (input.routingEpoch > input.epoch) {
+        handedBack = true;
+        return fauxAssistantMessage(
+          fauxToolCall("handback", {
+            triggerId: input.triggerId,
+            epoch: input.routingEpoch,
+            reason: "Presented routing epoch",
+          }),
+          { stopReason: "toolUse" },
+        );
+      }
+      return fauxAssistantMessage("waiting");
+    };
+    const { active } = await activate(
+      r,
+      directory,
+      Array.from({ length: 30 }, () => response),
+    );
+    await active.agents.waitForIdle();
+    expect(handedBack).toBe(true);
+    expect(
+      (await active.engine.store.read("disposition", source.triggerId))
+        .handbacks,
+    ).toContainEqual({
+      ticketId: a.id,
+      epoch: 3,
+      reason: "Presented routing epoch",
+    });
+  });
+  it("retries terminal native cancel claims and marks bounded exhaustion as attention", async () => {
+    const { r, directory } = await setup();
+    const a = await accept(r, "cancel-retry");
+    const { active } = await activate(r, directory);
+    await active.agents.waitForIdle();
+    const phase = active.agents.cancelTask.definition.phases.cancel;
+    active.agents.cancelTask.definition.phases.cancel = async () => {
+      throw new Error("Controlled terminal cancel fault");
+    };
+    try {
+      await active.stopTicket(a.id, alice, { commandId: "cancel-with-fault" });
+      for (let i = 0; i < 3; i++) {
+        await active.agents.pump();
+        const [intent] = await active.list("cancel");
+        await active.harness.waitForTask(intent.taskId, active.engine.context);
+      }
+      await active.agents.pump();
+      expect((await active.list("cancel"))[0].status).toBe("attention");
+      expect((await active.readTicket(a.id)).attention).toMatch(
+        /cancel.*3|3.*cancel/i,
+      );
+    } finally {
+      active.agents.cancelTask.definition.phases.cancel = phase;
+    }
+  });
+
+  it.each(["fault", "abort", "exhaustion"])(
+    "recovers a terminal native redrive claim after %s without readmitting queued input",
+    async (failure) => {
+      const { r, directory } = await setup();
+      const a = await accept(r, `redrive-${failure}`);
+      let entered!: () => void, release!: () => void;
+      const generationEntered = new Promise<void>(
+          (resolve) => (entered = resolve),
+        ),
+        generationGate = new Promise<void>((resolve) => (release = resolve));
+      let failed = false;
+      const response = async (ctx: any) => {
+        if (isRouter(ctx)) return fauxAssistantMessage("waiting");
+        const input = JSON.parse(userText(ctx));
+        if (ctx.messages.at(-1).role === "user")
+          return fauxAssistantMessage(
+            fauxToolCall("report", {
+              reportId: `consume-${input.inputId}`,
+              assignmentId: input.assignmentId,
+              epoch: input.epoch,
+              inputIds: [input.inputId],
+              status: "waiting",
+              content: "presented input consumed",
+            }),
+            { stopReason: "toolUse" },
+          );
+        if (!failed) {
+          failed = true;
+          entered();
+          await generationGate;
+          return fauxAssistantMessage("", {
+            stopReason: "error",
+            errorMessage: "Controlled invalid request",
+          });
+        }
+        return fauxAssistantMessage("waiting");
+      };
+      const { active } = await activate(
+        r,
+        directory,
+        Array.from({ length: 30 }, () => response),
+      );
+      let driveEntered!: () => void, releaseDrive!: () => void;
+      const driveStarted = new Promise<void>(
+          (resolve) => (driveEntered = resolve),
+        ),
+        driveGate = new Promise<void>((resolve) => (releaseDrive = resolve));
+      const definition = active.agents.redriveTask.definition;
+      const original = definition.phases.drive;
+      definition.phases.drive = async (...args: any[]) => {
+        if (failure === "abort") {
+          driveEntered();
+          await driveGate;
+          return original(...args);
+        }
+        throw new Error("Controlled terminal redrive fault");
+      };
+      try {
+        await generationEntered;
+        await active.agents.noteWorker(
+          active.agents.routerConversationId,
+          a.id,
+          "queued factual note",
+          "queued-redrive",
+        );
+        await active.agents.pump();
+        await until(async () =>
+          (await active.list("deliveryRun")).some(
+            (d: any) => !d.intentId && d.admitted,
+          ),
+        );
+        const queued = (await active.list("deliveryRun")).find(
+          (d: any) => !d.intentId,
+        );
+        release();
+        await until(
+          async () =>
+            (await active.list("deliveryRun")).find((d: any) => d.intentId)
+              .settled,
+        );
+        await active.agents.pump();
+        await until(async () => (await active.list("redrive")).length > 0);
+        let [claim] = await active.list("redrive");
+        const firstTaskId = claim.taskId;
+        if (failure === "abort") {
+          await driveStarted;
+          const aborting = active.harness.abortTask(
+            claim.taskId,
+            active.engine.context,
+          );
+          releaseDrive();
+          await aborting;
+        }
+        await active.harness.waitForTask(claim.taskId, active.engine.context);
+        if (failure === "exhaustion") {
+          for (let i = 0; i < 2; i++) {
+            await active.agents.pump();
+            [claim] = await active.list("redrive");
+            await active.harness.waitForTask(
+              claim.taskId,
+              active.engine.context,
+            );
+          }
+        }
+        definition.phases.drive = original;
+        await active.agents.pump();
+        await active.agents.waitForIdle();
+        [claim] = await active.list("redrive");
+        expect(claim.taskId).not.toBe(firstTaskId);
+        expect(claim.status).toBe(
+          failure === "exhaustion" ? "attention" : "completed",
+        );
+        expect(claim.attempts).toBe(failure === "exhaustion" ? 3 : 2);
+        const run = await active.engine.store.read("deliveryRun", queued.id);
+        expect(run.submissionId).toBe(queued.submissionId);
+        expect(run.requestId).toBe(queued.requestId);
+        expect(run.settled).toBe(true);
+        if (failure === "exhaustion") expect(run.status).toBe("attention");
+        else expect(run.consumed).toBe(true);
+      } finally {
+        release();
+        releaseDrive();
+        definition.phases.drive = original;
+      }
+    },
+  );
+
+  it("rechecks mutable intent semantics when context promotion races outside-commit prompt preparation", async () => {
+    const { r, directory } = await setup();
+    const a = await accept(r, "prepare-race");
+    const { active } = await activate(r, directory);
+    await active.agents.waitForIdle();
+    await active.subscribe(a.id, "cli", "prepare-context", false, {
+      commandId: "prepare-follow",
+    });
+    const source = await active.receive(event("prepare-context"));
+    const [candidate] = await active.listCandidates();
+    const spill = active.agents.artifacts.spill.bind(active.agents.artifacts);
+    let entered!: () => void, release!: () => void;
+    const prepared = new Promise<void>((resolve) => (entered = resolve)),
+      gate = new Promise<void>((resolve) => (release = resolve));
+    let held = false;
+    active.agents.artifacts.spill = async (text: string) => {
+      if (
+        !held &&
+        text.includes(source.triggerId) &&
+        text.includes('"own":false')
+      ) {
+        held = true;
+        entered();
+        await gate;
+      }
+      return spill(text);
+    };
+    try {
+      const pumping = active.agents.pump();
+      await prepared;
+      await active.decide(
+        candidate.id,
+        candidate.epoch,
+        { kind: "attach", ticketId: a.id },
+        { commandId: "promote-during-prepare" },
+      );
+      release();
+      await pumping;
+    } finally {
+      release();
+      active.agents.artifacts.spill = spill;
+    }
+    await active.agents.waitForIdle();
+    const run = (await active.list("deliveryRun")).find(
+      (d: any) => d.triggerId === source.triggerId,
+    );
+    expect(JSON.parse(run.prompt).own).toBe(true);
+  });
+
+  it("recovers an aborted cancel task and cancels the actual ownerless Worker generation", async () => {
+    const { r, directory } = await setup();
+    const a = await accept(r, "cancel-abort");
+    let started!: () => void,
+      releaseProvider!: () => void,
+      providerSignal: AbortSignal | undefined;
+    const providerStarted = new Promise<void>((resolve) => (started = resolve)),
+      providerGate = new Promise<void>(
+        (resolve) => (releaseProvider = resolve),
+      );
+    const { active } = await activate(r, directory, [
+      async (_ctx: any, options: any) => {
+        providerSignal = options.signal;
+        started();
+        await providerGate;
+        return fauxAssistantMessage("interrupted");
+      },
+    ]);
+    let cancelEntered!: () => void, releaseCancel!: () => void;
+    const cancelStarted = new Promise<void>(
+        (resolve) => (cancelEntered = resolve),
+      ),
+      cancelGate = new Promise<void>((resolve) => (releaseCancel = resolve));
+    const definition = active.agents.cancelTask.definition,
+      phase = definition.phases.cancel;
+    definition.phases.cancel = async (...args: any[]) => {
+      cancelEntered();
+      await cancelGate;
+      return phase(...args);
+    };
+    try {
+      await providerStarted;
+      await active.stopTicket(a.id, alice, {
+        commandId: "stop-aborted-cancel",
+      });
+      await active.agents.pump();
+      await cancelStarted;
+      const [first] = await active.list("cancel");
+      const aborting = active.harness.abortTask(
+        first.taskId,
+        active.engine.context,
+      );
+      releaseCancel();
+      await aborting;
+      await active.harness.waitForTask(first.taskId, active.engine.context);
+      definition.phases.cancel = phase;
+      await active.agents.pump();
+      await until(async () => providerSignal?.aborted === true);
+      releaseProvider();
+      await active.agents.waitForIdle();
+      const [recovered] = await active.list("cancel");
+      expect(recovered).toMatchObject({ status: "completed", attempts: 2 });
+      expect(recovered.taskId).not.toBe(first.taskId);
+    } finally {
+      releaseProvider();
+      releaseCancel();
+      definition.phases.cancel = phase;
+    }
+  });
+  it("recalls spilled frozen Worker authority through native paged tools without granting Policy access", async () => {
+    const { r, directory } = await setup();
+    const instructions = "Original frozen operating instructions. ".repeat(
+      1000,
+    );
+    await r.updatePolicy(
+      {
+        version: 2,
+        acceptMode: "auto",
+        allowedActors: ["alice"],
+        botActors: ["bot"],
+        rules: [
+          {
+            id: "large-rule",
+            enabled: true,
+            instructions,
+            capabilities: ["repo.read"],
+          },
+        ],
+      },
+      alice,
+      { commandId: "large-policy" },
+    );
+    await r.receive(
+      event("large-authority", {
+        actor: { id: "bot", kind: "bot", trusted: true },
+      }),
+    );
+    const [candidate] = await r.listCandidates();
+    await r.decide(
+      candidate.id,
+      candidate.epoch,
+      { kind: "accept", goal: "large authority", ruleIds: ["large-rule"] },
+      { commandId: "large-authority-ticket" },
+    );
+    let recovered = false;
+    const response = async (ctx: any) => {
+      if (isRouter(ctx)) return fauxAssistantMessage("waiting");
+      const input = JSON.parse(userText(ctx));
+      const pages = ctx.messages
+        .filter((m: any) => m.role === "toolResult" && m.toolName === "recall")
+        .map((m: any) => JSON.parse(m.content[0].text));
+      if (!pages.length)
+        return fauxAssistantMessage(
+          fauxToolCall("recall", { ref: input.authorityReference }),
+          { stopReason: "toolUse" },
+        );
+      const last = pages.at(-1);
+      expect(last.estimatedTokens).toBeLessThanOrEqual(8000);
+      if (last.cursor)
+        return fauxAssistantMessage(
+          fauxToolCall("recall", {
+            ref: input.authorityReference,
+            cursor: last.cursor,
+          }),
+          { stopReason: "toolUse" },
+        );
+      const authority = JSON.parse(pages.map((p: any) => p.text).join(""));
+      expect(authority.matchedRules[0].instructions).toBe(instructions);
+      expect(authority.mandate.capabilities).toEqual(["repo.read"]);
+      recovered = true;
+      return fauxAssistantMessage("waiting");
+    };
+    const { active } = await activate(
+      r,
+      directory,
+      Array.from({ length: 100 }, () => response),
+    );
+    await active.agents.waitForIdle();
+    expect(recovered).toBe(true);
+    const [run] = await active.list("deliveryRun");
+    expect(run.prompt.length).toBeLessThan(8000);
+    await expect(
+      active.agents.recall(run.conversationId, "policy:2"),
+    ).rejects.toThrow(/access/i);
+  });
 });

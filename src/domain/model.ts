@@ -23,7 +23,7 @@ export interface Source {
   listenedScopes?: string[];
   cursor?: JsonValue;
 }
-export interface PreparedEvent extends NormalizedEvent { bodyArtifact?: string }
+export interface PreparedEvent extends NormalizedEvent { bodyArtifact?: string; /** Host-only digest of the original normalized payload before spill. */ originalDigest?: string }
 export interface Trigger extends PreparedEvent { id: ID; ordinal: number; digest: string }
 export interface Thread { id: ID; sourceId: ID; externalRef: string; triggerIds: ID[]; lastOrdinal: number }
 export interface IntakeIntent { id: ID; triggerId: ID; status: 'pending' | 'accepted'; taskId: TaskId<null>; routed?: boolean; released?: boolean }
@@ -106,7 +106,7 @@ export interface Policy {
 export interface CommandMeta { commandId: string; expectedRevision?: number; /** Authenticated source input consumed by a stop command. */ triggerId?: ID }
 export interface Mandate {
   id: ID; actor: Actor; basis: 'explicit' | 'inferred'; policyVersion: number;
-  ruleIds: ID[]; capabilities: string[]; sourceId: ID; scope: string[]; withdrawnAt: number | null;
+  ruleIds: ID[]; capabilities: string[]; rulesSnapshot?: Rule[]; sourceId: ID; scope: string[]; withdrawnAt: number | null;
 }
 export interface Ticket {
   id: ID; goal: string; mandateId: ID; lifecycle: 'open' | 'ended' | 'stopped'; revision: number;
@@ -133,7 +133,7 @@ export type DecisionOutcome =
 export interface Decision { id: ID; evalId: ID; epoch: number; policyVersion: number; outcome: DecisionOutcome }
 export interface DeliveryIntent {
   id: ID; ticketId: ID; triggerId: ID; epoch: number; own: boolean; resume: boolean;
-  status: 'pending' | 'delivered' | 'invalid'; mode?: 'followUp' | 'steer';
+  status: 'pending' | 'delivered' | 'invalid'; ownershipOf?: ID; mode?: 'followUp' | 'steer';
 }
-export interface CancelIntent { id: ID; ticketId: ID; assignmentId: ID; epoch: number; status: 'pending' | 'completed'; reason: string }
+export interface CancelIntent { id: ID; ticketId: ID; assignmentId: ID; epoch: number; status: 'pending' | 'completed' | 'attention'; reason: string }
 export interface Report { ticketId: ID; assignmentId: ID; epoch: number; content: JsonValue }
