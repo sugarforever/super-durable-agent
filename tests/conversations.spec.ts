@@ -909,7 +909,7 @@ describe("native Router, ownerless Workers and durable delivery", () => {
       tasks: Object.fromEntries(
         Object.entries(metadata.tasks).filter(
           ([name]) =>
-            !["sa.agentInput", "sa.cancel", "sa.redrive", "sa.job"].includes(name),
+            !["sa.agentInput", "sa.cancel", "sa.redrive", "sa.job", "sa.outbox"].includes(name),
         ),
       ),
     };

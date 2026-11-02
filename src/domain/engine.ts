@@ -1,3 +1,4 @@
+import type { Outbox } from '../services/outbox.js';
 import type { Context, JsonValue } from '@earendil-works/chord';
 import { defineTask, type Conversation, type Harness, type Tx } from '@earendil-works/pi-durable';
 import { Scheduler, type Clock } from '../runtime/scheduler.js';
@@ -33,6 +34,7 @@ export function createIntakeTask(store: DomainStore) {
 export class Engine {
   readonly authorization = new PolicyController(this);
   readonly scheduler: Scheduler;
+  outbox?: Outbox;
   /** Host preprocessing performs artifact IO before entering a transaction. */
   prepareEvent?: (event: NormalizedEvent) => Promise<PreparedEvent>;
 

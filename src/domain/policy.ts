@@ -42,6 +42,7 @@ export class PolicyController {
       for (const rule of policy.rules) {
         nonempty(rule.id, 'rule ID'); nonempty(rule.instructions, 'rule instructions');
         if (typeof rule.enabled !== 'boolean' || !Array.isArray(rule.capabilities) || ruleIds.has(rule.id)) throw new Error('Invalid or duplicate rule');
+        if (rule.communication !== undefined && (!rule.communication || typeof rule.communication !== 'object' || Array.isArray(rule.communication) || Object.entries(rule.communication).some(([key, value]) => !['acknowledgements', 'progress'].includes(key) || typeof value !== 'boolean'))) throw new Error('Invalid rule communication constraints');
         ruleIds.add(rule.id); for (const capability of rule.capabilities) nonempty(capability, 'capability');
       }
       await this.store.put(tx, 'policy', 'current', policy);

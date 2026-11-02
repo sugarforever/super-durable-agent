@@ -1,3 +1,4 @@
+import { Outbox, type OutboxOptions } from '../services/outbox.js';
 import type { EnvironmentOptions } from "../services/jobs.js";
 import { reconcile } from "./reconcile.js";
 import type { Clock } from "./scheduler.js";
@@ -46,11 +47,13 @@ export interface OpenOptions {
   clock?: Clock;
   cancellationHandler?: CancellationHandler;
   environment?: EnvironmentOptions;
+  outbox?: OutboxOptions;
   /** Additional recovery checks run while scheduling is paused. Throwing closes storage and releases the lock. */
   preflight?: (engine: Engine) => Promise<void>;
 }
 export interface SuperAgentRuntime {
   readonly engine: Engine;
+  readonly outbox: Outbox;
   readonly harness: Harness;
   readonly control: Conversation;
   readonly agents: AgentCoordinator | undefined;
@@ -191,6 +194,8 @@ export async function openSuperAgent(
         ...(body.artifact ? { bodyArtifact: body.artifact } : {}),
       };
     };
+    const outbox = new Outbox(engine, options.outbox, options.clock);
+    engine.outbox = outbox;
     const coordinator = new AgentCoordinator(engine, artifacts, options.model, options.cancellationHandler, options.environment);
     registry.install(coordinator.routerExtension);
     registry.install(coordinator.workerExtension);
@@ -202,6 +207,7 @@ export async function openSuperAgent(
           coordinator.cancelTask,
           coordinator.redriveTask,
           coordinator.jobs.task,
+          outbox.task,
         ],
       }),
     );
@@ -232,7 +238,8 @@ export async function openSuperAgent(
         canonicalJson(previousDefinitions) !== canonicalJson(definitions) &&
         canonicalJson(previousDefinitions) !==
           canonicalJson(baselineDefinitions) &&
-        canonicalJson(previousDefinitions) !== canonicalJson({ ...definitions, tasks: Object.fromEntries(Object.entries(definitions.tasks).filter(([name]) => name !== "sa.job")) })
+        canonicalJson(previousDefinitions) !== canonicalJson({ ...definitions, tasks: Object.fromEntries(Object.entries(definitions.tasks).filter(([name]) => name !== "sa.outbox")) }) &&
+        canonicalJson(previousDefinitions) !== canonicalJson({ ...definitions, tasks: Object.fromEntries(Object.entries(definitions.tasks).filter(([name]) => !["sa.job", "sa.outbox"].includes(name))) })
       ) {
         throw new Error(
           "Installed extension/task definitions do not match persisted metadata",
@@ -270,6 +277,7 @@ export async function openSuperAgent(
         });
     });
     await reconcile(engine);
+    await outbox.reconcile();
     // An explicit model activates execution. A model-free recovery keeps live
     // agent tasks durable and paused; domain receives/commands still commit.
     const recoveredAgentWork =
@@ -277,7 +285,7 @@ export async function openSuperAgent(
       (await harness.inspect(context)).tasks.some(
         (task) =>
           (task.record.kind.startsWith("sa.") &&
-            task.record.kind !== "sa.intake") ||
+            task.record.kind !== "sa.intake" && task.record.kind !== "sa.outbox") ||
           task.record.kind === "pi.generation",
       );
     if (!recoveredAgentWork) harness.resume();
@@ -287,6 +295,7 @@ export async function openSuperAgent(
     let closing: Promise<void> | undefined;
     return {
       engine,
+      outbox,
       harness,
       control,
       agents,
@@ -320,6 +329,7 @@ export async function openSuperAgent(
       close: () =>
         (closing ??= (async () => {
           try {
+            outbox.close();
             await coordinator.close();
             await openedHarness.close(context);
           } finally {

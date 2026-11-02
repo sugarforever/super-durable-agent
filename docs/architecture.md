@@ -234,9 +234,9 @@ Pi restores checkpoints/inbox/generation/tool state. Reconciler repairs domain/e
 | Missing definition/migration failure | Fail closed with diagnostics and recovery instructions |
 | Endpoint disconnected/cancel pending | Query on reconnect; do not repeat unknown operation |
 
-Pi Task `waiting.on` refers to Task IDs, not arbitrary domain events. External waiting is represented in documents and awakened by new intake/dispatch. Delays persist nextAttemptAt in checkpoints and use runtime.sleep; memory-only timers are insufficient after restart.
+Pi Task `waiting.on` refers to Task IDs, not arbitrary domain events. External waiting is represented in documents and awakened by new intake/dispatch. Continuing Task delays persist their deadline in checkpoints and use runtime.sleep. Deferred Outbox intents instead persist nextAttemptAt transactionally and use finite sender Tasks when due; startup and explicit reconciliation recover due work. An unreferenced host timer may wake that reconciler, but never owns retry state. Memory-only timers are insufficient after restart.
 
-SQLite WAL/NORMAL supports process-crash recovery but does not promise zero loss on power/host failure. Backup/restore must capture a consistent database plus artifacts and compatible definitions; restore into a new directory and verify before replacing service state. A corrupt/unsupported store is not silently initialized as empty.
+SQLite WAL/NORMAL supports process-crash recovery but does not promise zero loss on power/host failure. Backup/restore must capture a consistent database plus artifacts and compatible definitions; restore into a new directory and verify before replacing service state. Endpoint operation admissions and receipts are independent safety-critical state: preserve/validate local broker ledgers and repository dependencies, or require reconciliation with the original endpoint before resuming active Jobs. An empty replacement broker is not evidence that an old command was never launched. A corrupt/unsupported store is not silently initialized as empty.
 
 Future cloud deployment still needs one active writer per Session. Pi 1.1.0 provides no cross-process ownership lease or distributed SQLite writer election; external leases/fencing/storage failover are prerequisites, not implied capabilities.
 

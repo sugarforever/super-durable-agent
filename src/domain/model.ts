@@ -93,7 +93,7 @@ export function normalizeEvent(event: NormalizedEvent): NormalizedEvent {
   };
 }
 
-export interface Rule { id: ID; enabled: boolean; instructions: string; capabilities: string[] }
+export interface Rule { id: ID; enabled: boolean; instructions: string; capabilities: string[]; communication?: { acknowledgements?: boolean; progress?: boolean } }
 export interface Policy {
   version: number;
   acceptMode: 'off' | 'observe' | 'auto';
