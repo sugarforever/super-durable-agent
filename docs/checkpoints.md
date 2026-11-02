@@ -9,7 +9,7 @@ Each row corresponds to one requirement issue and one incremental PR. A PR targe
 | 3 | Authorization and subscription ownership | [#3](https://github.com/sugarforever/super-durable-agent/issues/3) | [#13](https://github.com/sugarforever/super-durable-agent/pull/13) | `codex/02-domain-kernel` | Implemented; user approval pending |
 | 4 | Router and Worker conversations with durable delivery | [#4](https://github.com/sugarforever/super-durable-agent/issues/4) | [#14](https://github.com/sugarforever/super-durable-agent/pull/14) | `codex/03-policy-ownership` | Implemented; user approval pending |
 | 5 | Capacity scheduling and cancellation fencing | [#5](https://github.com/sugarforever/super-durable-agent/issues/5) | [#15](https://github.com/sugarforever/super-durable-agent/pull/15) | `codex/04-agent-conversations` | Implemented; user approval pending |
-| 6 | Local environments and asynchronous jobs | [#6](https://github.com/sugarforever/super-durable-agent/issues/6) | Pending | `codex/05-scheduling-cancellation` | Planned |
+| 6 | Local environments and asynchronous jobs | [#6](https://github.com/sugarforever/super-durable-agent/issues/6) | [#16](https://github.com/sugarforever/super-durable-agent/pull/16) | `codex/05-scheduling-cancellation` | Implemented; user approval pending |
 | 7 | Transactional Outbox and external effect recovery | [#7](https://github.com/sugarforever/super-durable-agent/issues/7) | Pending | `codex/06-environments-jobs` | Planned |
 | 8 | CLI, GitHub integration and management API | [#8](https://github.com/sugarforever/super-durable-agent/issues/8) | Pending | `codex/07-outbox` | Planned |
 | 9 | Remote endpoint daemon and Feishu integration | [#9](https://github.com/sugarforever/super-durable-agent/issues/9) | Pending | `codex/08-github-management` | Planned |
@@ -67,3 +67,7 @@ Implementation commit `f61dacd`. 92 tests pass across five files, including 34 n
 ## Part 5 evidence
 
 Implementation commit `996c7c9`. 111 tests across seven files pass, plus typecheck/build, seven pi probes and English-document checks. Scoped correction review resolved cancellation monotonicity, endpoint-only retry fencing, and pre-admission reservation recovery, with native barrier and SIGKILL regressions. No real broker, provider, or external-account trial was executed. Independent scoped specification/quality review completed with important findings resolved. User approval and merge remain pending.
+
+## Part 6 evidence
+
+Implementation commit `98472cc`. 135 tests across eight files pass, plus typecheck/build, seven pi probes and English-document checks. Scoped correction review cleared process-group cancellation supervision, bounded unknown outcomes with inherited pipes, and canonical repository checks for retained worktree replay. Real git/subprocess/native crash tests cover the local broker. No real remote device, provider, or account trial was executed. Independent scoped specification/quality review completed with important findings resolved. User approval and merge remain pending.
