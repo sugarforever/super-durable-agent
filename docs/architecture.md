@@ -181,7 +181,7 @@ stateDiagram-v2
   person --> stopped: Authenticated stop
 ```
 
-Worker `report` accepts progress/waiting/ready/blocked/failed/dropped and questions. Validate Worker binding, Ticket, assignmentEpoch, reportId, and consumed input IDs. Plain final prose is not ready; without a structured Report, conservatively record waiting or attention. Ready means reviewable, not accepted. An open tracked PR keeps the Ticket open. Closure/merge ends work only if no pending followup or newer execution remains. Untracked one-shot work can end under an explicit acceptance policy.
+Worker `report` accepts progress/waiting/ready/blocked/failed/dropped and questions. Validate Worker binding, Ticket, assignmentEpoch, reportId, and consumed input IDs. Plain final prose is not ready; without a structured Report, conservatively record waiting or attention. Ready means reviewable, not accepted. An open tracked PR keeps the Ticket open. Closure/merge ends work only if no pending followup, newer execution, active/unknown Job, or unsettled current final-message obligation remains. Untracked one-shot work can end under an explicit acceptance policy.
 
 Reports/questions/artifacts go through purpose-aware Outbox. Keep tool logs internal; IM replies are concise, GitHub descriptions include the problem/change/validation. Silence rules suppress unnecessary acknowledgements and progress. Routine progress need not wake Router.
 

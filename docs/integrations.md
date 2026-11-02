@@ -28,6 +28,7 @@ Set the environment variables referenced by the configuration outside the comman
   "githubRepositories": ["owner/repository"],
   "githubSecretEnv": "GITHUB_WEBHOOK_SECRET",
   "githubTokenEnv": "GITHUB_TOKEN",
+  "githubOwnLogins": ["your-automation-login"],
   "listenedScopes": ["owner/repository#123"]
 }
 ```
@@ -58,13 +59,15 @@ JSON bodies are limited to 1 MiB. Authentication precedes management body parsin
 
 ## GitHub protocol and lifecycle
 
-GitHub intake verifies HMAC-SHA256 over exact raw request bytes before JSON parsing, restricts repositories/listened Threads, and qualifies external identities as github:login. An external account named operator does not become the local operator. Semantic event identity prevents a changed unsigned delivery header from creating duplicate work. Authenticated own-send markers suppress echoed intake while preserving independent closure facts. See [GitHub signature documentation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries) and [event schemas](https://docs.github.com/en/webhooks/webhook-events-and-payloads).
+GitHub intake verifies HMAC-SHA256 over exact raw request bytes before JSON parsing, restricts repositories/listened Threads, and qualifies external identities as github:login. An external account named operator does not become the local operator. Payload-family validation and semantic event identity prevent changed unsigned event/delivery headers from creating new work. CI event families remain automation input even when the triggering account is a User. Echo suppression validates the exact message/entity and preserves independent closure facts; a copied public marker cannot discard another person’s feedback. See [GitHub signature documentation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries) and [event schemas](https://docs.github.com/en/webhooks/webhook-events-and-payloads).
 
 Supported families include Issues, issue comments, PRs, reviews/review comments, check runs/suites, and statuses. A trusted receivePoll hook atomically commits collector events and cursor; the service has no autonomous polling collector. Webhooks are the executable intake transport in this checkpoint.
 
-The sender posts Issue/PR comments through Outbox. Receipt lookup scans bounded repository-comment pages for an authenticated key marker. Missing markers remain unknown; no invented idempotency header or authoritative absence is assumed. See [GitHub comment API](https://docs.github.com/en/rest/issues/comments).
+Configure githubOwnLogins (or repeatable --github-own-login) with the actual automation sender login before enabling outbound comments. This host-only identity permits matching an exact durable message intent during the normal webhook-before-receipt race, for both bot and User tokens. Without sender configuration, sending fails closed; intake and receipt inspection remain available.
 
-A ready Report leaves an open tracked PR Ticket open. Authenticated closure/merge facts permit ending only after all required tracked Threads close and no unread input, newer execution, or active/unknown Job remains. Human own-Thread feedback can resume the same naturally ended Ticket after Policy revalidation; bots and explicit stop cannot do so.
+The sender posts Issue/PR comments through Outbox. Receipt lookup scans bounded newest-first repository-comment pages for an authenticated key marker. Missing markers remain unknown; no invented idempotency header or authoritative absence is assumed. See [GitHub comment API](https://docs.github.com/en/rest/issues/comments).
+
+A ready Report leaves an open tracked PR Ticket open. Authenticated closure/merge facts permit ending only after all required tracked Threads close and no unread input, newer execution, active/unknown Job, or unsettled current final-message obligation remains. Human own-Thread feedback can resume the same naturally ended Ticket after Policy revalidation; bots and explicit stop cannot do so.
 
 Trusted trackPullRequest/Engine.trackThread callbacks bind a confirmed created PR, with original/current pr.create and source/repository checks for scope expansion. This adapter sends comments and tracks lifecycle. PR creation can use explicitly enabled trusted execution with host tooling; there is no structured PR creation or merge tool. A Worker claim cannot establish that a PR merged.
 

@@ -1,5 +1,6 @@
 import type { Tx } from "@earendil-works/pi-durable";
 import type { Engine } from "./engine.js";
+import type { OutboundMessage } from "../services/outbox.js";
 import type { AgentRun } from "../durable/tasks/agent-input.js";
 import {
   scopedId,
@@ -163,7 +164,7 @@ export class TicketLifecycle {
       return;
     await this.engine.store.put(tx, "sourceThreadState", key, fact);
   }
-  async completeInTransaction(tx: Tx) {
+  async completeInTransaction(tx: Tx, onlyTicketId?: string) {
     const { store } = this.engine;
     const tracked = await store.listInTransaction<TrackedThread>(
       tx,
@@ -188,8 +189,13 @@ export class TicketLifecycle {
       ticketId: string;
       status: string;
     }>(tx, "job");
+    const outgoing = await store.listInTransaction<OutboundMessage>(
+      tx,
+      "outbox",
+    );
     const tasks = await nativeTasks(tx);
     for (const id of new Set(tracked.map((t) => t.ticketId))) {
+      if (onlyTicketId !== undefined && id !== onlyTicketId) continue;
       const ticket = await store.get<Ticket>(tx, "ticket", id),
         report = ticket?.latestReport as any;
       if (
@@ -258,6 +264,16 @@ export class TicketLifecycle {
           (j) =>
             j.ticketId === id &&
             !["completed", "failed", "cancelled"].includes(j.status),
+        )
+      )
+        continue;
+      if (
+        outgoing.some(
+          (message) =>
+            message.ticketId === id &&
+            message.assignmentEpoch === ticket.assignmentEpoch &&
+            ["answer", "question", "attention"].includes(message.purpose) &&
+            !["sent", "invalid", "dropped"].includes(message.status),
         )
       )
         continue;

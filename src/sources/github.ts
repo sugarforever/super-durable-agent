@@ -31,6 +31,8 @@ export interface GitHubOptions {
   enabled?: boolean;
   listenedScopes?: string[];
   addressed?: boolean;
+  /** Verified host configuration for the account used by outbound automation. */
+  ownLogins?: string[];
 }
 export interface GitHubPollEvent {
   event: string;
@@ -53,6 +55,7 @@ export class GitHubSource implements SourceAdapter {
   readonly sourceId: string;
   readonly enabled: boolean;
   private readonly repositories: Set<string>;
+  private readonly ownLogins: Set<string>;
   private readonly base: string;
   private readonly requests = new Set<AbortController>();
   constructor(private readonly options: GitHubOptions) {
@@ -85,6 +88,19 @@ export class GitHubSource implements SourceAdapter {
         typeof options.addressed !== "boolean")
     )
       throw new Error("Invalid GitHub source flags");
+    if (
+      options.ownLogins !== undefined &&
+      (!Array.isArray(options.ownLogins) ||
+        options.ownLogins.some(
+          (login) =>
+            typeof login !== "string" ||
+            !/^[a-z0-9][a-z0-9-]*(?:\[bot\])?$/i.test(login),
+        ))
+    )
+      throw new Error("Invalid configured GitHub own logins");
+    this.ownLogins = new Set(
+      (options.ownLogins ?? []).map((login) => login.toLowerCase()),
+    );
     this.repositories = new Set(
       options.repositories.map((r) => r.toLowerCase()),
     );
@@ -128,27 +144,146 @@ export class GitHubSource implements SourceAdapter {
     const hash = digest([this.sourceId, key]);
     return `<!-- super-agent:${hash}:${createHmac("sha256", this.options.webhookSecret).update(hash).digest("hex")} -->`;
   }
-  private ownMarker(body: string) {
-    return [
-      ...body.matchAll(/<!-- super-agent:([a-f0-9]{64}):([a-f0-9]{64}) -->/g),
-    ].some((m) =>
-      equal(
-        m[2],
-        createHmac("sha256", this.options.webhookSecret)
-          .update(m[1])
-          .digest("hex"),
-      ),
+  private family(payload: ObjectValue): string {
+    const keys = [
+      "issue",
+      "pull_request",
+      "comment",
+      "review",
+      "check_run",
+      "check_suite",
+    ].filter((key) => payload[key] !== undefined);
+    const shape = keys.sort().join(",");
+    const families: Record<string, string> = {
+      issue: "issues",
+      "comment,issue": "issue_comment",
+      pull_request: "pull_request",
+      "pull_request,review": "pull_request_review",
+      "comment,pull_request": "pull_request_review_comment",
+      check_run: "check_run",
+      check_suite: "check_suite",
+    };
+    if (families[shape]) return families[shape];
+    if (
+      !keys.length &&
+      typeof payload.sha === "string" &&
+      typeof payload.state === "string" &&
+      typeof payload.context === "string"
+    )
+      return "status";
+    if (!keys.length && typeof payload.zen === "string" && payload.hook)
+      return "ping";
+    throw new GitHubError(
+      422,
+      "Unsupported or ambiguous GitHub payload family",
     );
+  }
+  private render(message: Readonly<OutboundMessage>, key: string): string {
+    const payload = message.payload as any;
+    const content =
+      typeof payload === "string"
+        ? payload
+        : typeof payload?.content === "string"
+          ? payload.content
+          : JSON.stringify(payload);
+    return `## Agent ${message.purpose}\n\n${content}\n\n${this.marker(key)}`;
+  }
+  private async ownEcho(
+    runtime: SuperAgentRuntime,
+    event: string,
+    payload: unknown,
+    normalized: NormalizedEvent | undefined,
+  ): Promise<boolean> {
+    if (event !== "issue_comment" || !normalized) return false;
+    const value = object(payload),
+      comment = value.comment;
+    if (
+      value.action !== "created" ||
+      !Number.isSafeInteger(comment?.id) ||
+      typeof comment.body !== "string" ||
+      !comment.user?.login ||
+      value.sender?.login !== comment.user.login
+    )
+      return false;
+    const messages = await runtime.list<OutboundMessage>("outbox");
+    return messages.some((message) => {
+      const receipt = message.receipt as { id?: number } | undefined;
+      return (
+        message.destination.sourceId === this.sourceId &&
+        normalized.threads.includes(message.destination.threadRef) &&
+        (receipt?.id === comment.id ||
+          (!receipt &&
+            this.ownLogins.has(value.sender.login.toLowerCase()) &&
+            ["pending", "queued", "sending", "retrying", "uncertain"].includes(
+              message.status,
+            ))) &&
+        comment.body === this.render(message, message.idempotencyKey)
+      );
+    });
   }
   private normalize(
     event: string,
     input: unknown,
-    suppressOwn = true,
   ): NormalizedEvent | undefined {
     const p = object(input),
       repo = String(p.repository?.full_name ?? "").toLowerCase();
     if (!this.repositories.has(repo))
       throw new GitHubError(403, "GitHub repository is not allowed");
+    if (this.family(p) !== event)
+      throw new GitHubError(
+        422,
+        "GitHub event header does not match signed payload family",
+      );
+    const allowedActions: Record<string, string[]> = {
+      issues: [
+        "opened",
+        "edited",
+        "deleted",
+        "transferred",
+        "pinned",
+        "unpinned",
+        "closed",
+        "reopened",
+        "assigned",
+        "unassigned",
+        "labeled",
+        "unlabeled",
+        "locked",
+        "unlocked",
+        "milestoned",
+        "demilestoned",
+      ],
+      issue_comment: ["created", "edited", "deleted"],
+      pull_request: [
+        "assigned",
+        "unassigned",
+        "labeled",
+        "unlabeled",
+        "opened",
+        "edited",
+        "closed",
+        "reopened",
+        "synchronize",
+        "converted_to_draft",
+        "ready_for_review",
+        "locked",
+        "unlocked",
+        "review_requested",
+        "review_request_removed",
+        "auto_merge_enabled",
+        "auto_merge_disabled",
+        "enqueued",
+        "dequeued",
+        "milestoned",
+        "demilestoned",
+      ],
+      pull_request_review: ["submitted", "edited", "dismissed"],
+      pull_request_review_comment: ["created", "edited", "deleted"],
+      check_run: ["created", "completed", "rerequested", "requested_action"],
+      check_suite: ["completed", "requested", "rerequested"],
+    };
+    if (allowedActions[event] && !allowedActions[event].includes(p.action))
+      throw new GitHubError(422, "Unsupported GitHub event action");
     let item: ObjectValue | undefined, number: number | undefined;
     if (event === "issues") {
       item = p.issue;
@@ -178,7 +313,7 @@ export class GitHubSource implements SourceAdapter {
       login = sender.login;
     if (typeof login !== "string" || !login.trim())
       throw new GitHubError(400, "Missing GitHub sender");
-    const body = [
+    let body = [
       item.title,
       item.body,
       item.description,
@@ -188,7 +323,6 @@ export class GitHubSource implements SourceAdapter {
     ]
       .filter((x) => typeof x === "string")
       .join("\n");
-    if (suppressOwn && this.ownMarker(body)) return undefined;
     const refs = number
       ? [`${repo}#${number}`]
       : [`${repo}@${item.head_sha ?? item.sha ?? item.id}`];
@@ -210,15 +344,19 @@ export class GitHubSource implements SourceAdapter {
         "",
     );
     const timestamp = Number.isFinite(parsedTime) ? parsedTime : 0;
+    const automation = ["check_run", "check_suite", "status"].includes(event);
+    if (automation)
+      body = `GitHub ${event} triggered by github:${login.toLowerCase()}\n${body}`;
     const actor = {
-      id: `github:${login.toLowerCase()}`,
-      kind:
-        login === "ghost"
+      id: automation ? `github:ci:${event}` : `github:${login.toLowerCase()}`,
+      kind: automation
+        ? ("bot" as const)
+        : login === "ghost"
           ? ("system" as const)
           : sender.type === "Bot" || login.endsWith("[bot]")
             ? ("bot" as const)
             : ("human" as const),
-      trusted: sender.type === "User" && login !== "ghost",
+      trusted: !automation && sender.type === "User" && login !== "ghost",
     };
     const stable = {
       event,
@@ -277,8 +415,10 @@ export class GitHubSource implements SourceAdapter {
     } catch {
       throw new GitHubError(400, "Invalid webhook JSON");
     }
-    const normalized = this.normalize(event, payload);
-    const factEvent = normalized ?? this.normalize(event, payload, false);
+    const factEvent = this.normalize(event, payload);
+    const normalized = (await this.ownEcho(runtime, event, payload, factEvent))
+      ? undefined
+      : factEvent;
     const source = await runtime.engine.store.read<{ cursor?: JsonValue }>(
       "source",
       this.sourceId,
@@ -328,26 +468,41 @@ export class GitHubSource implements SourceAdapter {
     events: GitHubPollEvent[],
     cursor: JsonValue,
   ): Promise<ReceiveBatchResult> {
-    const normalized = events.flatMap((e) => {
-      const item = this.normalize(e.event, e.payload);
-      return item ? [item] : [];
-    });
+    const prepared = await Promise.all(
+      events.map(async (event) => {
+        const fact = this.normalize(event.event, event.payload);
+        return {
+          ...event,
+          fact,
+          normalized: (await this.ownEcho(
+            runtime,
+            event.event,
+            event.payload,
+            fact,
+          ))
+            ? undefined
+            : fact,
+        };
+      }),
+    );
+    const normalized = prepared.flatMap((event) =>
+      event.normalized ? [event.normalized] : [],
+    );
     const result = await runtime.engine.receiveBatch(
       normalized,
       { sourceId: this.sourceId, value: cursor },
       async (tx, results) => {
         let index = 0;
-        for (const event of events) {
-          const n = this.normalize(event.event, event.payload);
+        for (const event of prepared) {
+          const n = event.normalized;
           if (!n) {
-            const fact = this.normalize(event.event, event.payload, false);
-            if (fact)
+            if (event.fact)
               await this.recordFacts(
                 runtime,
                 tx,
                 event.event,
                 event.payload,
-                fact,
+                event.fact,
               );
             continue;
           }
@@ -446,21 +601,16 @@ export class GitHubSource implements SourceAdapter {
   ): Promise<JsonValue> {
     if (!this.listened(message.destination))
       throw new NoSendError("GitHub destination unavailable");
+    if (!this.ownLogins.size)
+      throw new NoSendError("GitHub outbound requires a configured own login");
     const [repo, number] = message.destination.threadRef.split("#");
-    const payload = message.payload as any;
-    const content =
-      typeof payload === "string"
-        ? payload
-        : typeof payload?.content === "string"
-          ? payload.content
-          : JSON.stringify(payload);
     const response = await this.request(
       `/repos/${repo}/issues/${number}/comments`,
       {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          body: `## Agent ${message.purpose}\n\n${content}\n\n${this.marker(key)}`,
+          body: this.render(message, key),
         }),
       },
     );
@@ -479,7 +629,7 @@ export class GitHubSource implements SourceAdapter {
       for (const repo of this.repositories)
         for (let page = 1; page <= 10; page++) {
           const response = await this.request(
-            `/repos/${repo}/issues/comments?per_page=100&page=${page}`,
+            `/repos/${repo}/issues/comments?sort=created&direction=desc&per_page=100&page=${page}`,
           );
           if (!response.ok) return { status: "unknown" };
           const data = response.data;

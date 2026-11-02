@@ -44,6 +44,7 @@ Options:
   --github-repo OWNER/REPO  Repeatable GitHub repository allowlist.
   --github-secret-env NAME  GitHub webhook secret environment reference.
   --github-token-env NAME   GitHub API token environment reference.
+  --github-own-login LOGIN  Repeatable verified outbound account login; required to send.
   --listened-scope REF  Repeatable listened GitHub thread refs (owner/repo#number).
 
 Init, receive, list, show, policy and demo need no model credentials.
@@ -61,6 +62,7 @@ interface Config {
   githubRepositories?: string[];
   githubSecretEnv?: string;
   githubTokenEnv?: string;
+  githubOwnLogins?: string[];
   listenedScopes?: string[];
   environment?: {
     repository: string;
@@ -79,6 +81,7 @@ const allowedConfig = new Set([
   "githubRepositories",
   "githubSecretEnv",
   "githubTokenEnv",
+  "githubOwnLogins",
   "listenedScopes",
   "environment",
 ]);
@@ -368,9 +371,17 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       "--github-secret-env": "githubSecretEnv",
       "--github-token-env": "githubTokenEnv",
     };
-    if (arg === "--github-repo" || arg === "--listened-scope") {
+    if (
+      arg === "--github-repo" ||
+      arg === "--listened-scope" ||
+      arg === "--github-own-login"
+    ) {
       const key =
-        arg === "--github-repo" ? "githubRepositories" : "listenedScopes";
+        arg === "--github-repo"
+          ? "githubRepositories"
+          : arg === "--github-own-login"
+            ? "githubOwnLogins"
+            : "listenedScopes";
       (overrides[key] ??= []).push(value);
     } else if (names[arg])
       Object.assign(overrides, {
@@ -445,6 +456,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
           )!,
           apiToken: secret(config.githubTokenEnv ?? "GITHUB_TOKEN"),
           listenedScopes: config.listenedScopes,
+          ownLogins: config.githubOwnLogins,
         })
       : undefined;
   const event = command === "receive" ? await stdinJson() : undefined;

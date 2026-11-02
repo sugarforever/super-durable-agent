@@ -5,17 +5,20 @@ import { join } from "node:path";
 import { createHmac } from "node:crypto";
 import { createServer } from "node:http";
 import { spawnSync } from "node:child_process";
-import { openSuperAgent } from "../src/runtime/open.js";
+import { openSuperAgent, type OpenOptions } from "../src/runtime/open.js";
 import * as api from "../src/api/server.js";
 import * as gh from "../src/sources/github.js";
 const resources: (() => Promise<any>)[] = [];
 afterEach(async () => {
   for (const close of resources.splice(0).reverse()) await close();
 });
-async function setup(maxPending?: number) {
+async function setup(
+  maxPending?: number,
+  options: Pick<OpenOptions, "outbox"> = {},
+) {
   const directory = await mkdtemp(join(tmpdir(), "sa-integration-"));
   resources.push(() => rm(directory, { recursive: true, force: true }));
-  const r = await openSuperAgent({ directory, maxPending });
+  const r = await openSuperAgent({ directory, maxPending, ...options });
   resources.push(() => r.close());
   return { r, directory };
 }
@@ -28,7 +31,15 @@ const policy = {
 };
 const operator = { id: "operator", kind: "human" as const, trusted: true };
 const payload = (patch: any = {}) => ({
-  action: "opened",
+  action: patch.comment
+    ? "created"
+    : patch.review
+      ? "submitted"
+      : patch.check_run
+        ? "created"
+        : patch.check_suite
+          ? "completed"
+          : "opened",
   repository: { full_name: "acme/repo" },
   sender: { login: "alice", type: "User" },
   issue: {
@@ -199,7 +210,7 @@ it("deduplicates semantic payload despite unsigned delivery changes and source q
   expect(await r.list<any>("trigger")).toHaveLength(1);
   expect((await r.list<any>("trigger"))[0].actor.id).toBe("github:operator");
 });
-it("suppresses own send markers and respects source listening/disabled state", async () => {
+it("preserves unverified human markers and respects source listening/disabled state", async () => {
   const { r } = await setup();
   const a = await github(r);
   const p = raw(
@@ -212,7 +223,7 @@ it("suppresses own send markers and respects source listening/disabled state", a
     }),
   );
   await a.webhook(r, p, headers(p, "issue_comment"));
-  expect(await r.list("trigger")).toEqual([]);
+  expect(await r.list("trigger")).toHaveLength(1);
   await r.engine.configureSource({
     id: "github",
     kind: "github",
@@ -220,7 +231,7 @@ it("suppresses own send markers and respects source listening/disabled state", a
   });
   const q = raw(payload());
   await a.webhook(r, q, headers(q));
-  expect(await r.list("trigger")).toEqual([]);
+  expect(await r.list("trigger")).toHaveLength(1);
 });
 it("webhook backpressure is retryable and does not commit receipt or polling cursor", async () => {
   const { r } = await setup(1);
@@ -326,6 +337,7 @@ it("GitHub transport uses real local HTTP marker receipts and no invented idempo
   const a = await github(r, {
     apiBase: `http://127.0.0.1:${(fixture.address() as any).port}`,
     apiToken: "private",
+    ownLogins: ["agent-user"],
   });
   expect(await a.queryReceipt("k")).toEqual({ status: "unknown" });
   const message: any = {
@@ -364,7 +376,11 @@ it("credential-free demo subprocess reports native Router Worker feedback and di
 
 it("ready PR stays open; authenticated merge waits for unread work then naturally ends and human feedback resumes the same Ticket", async () => {
   const { r, directory } = await setup();
-  await r.updatePolicy(policy, operator, { commandId: "p" });
+  await r.updatePolicy(
+    { ...policy, explicitCapabilities: ["repo.read"] },
+    operator,
+    { commandId: "p" },
+  );
   const a = await github(r, { addressed: true });
   const pr = (action: string, time: string, state = "open") =>
     payload({
@@ -510,7 +526,7 @@ it("ready PR stays open; authenticated merge waits for unread work then naturall
   await a.webhook(active, later, headers(later, "issue_comment", "later"));
   expect((await active.readTicket<any>(ticket.id)).lifecycle).toBe("stopped");
 });
-it("suppresses own PR text without losing independently authenticated closure facts", async () => {
+it("preserves marked human PR actions and independently authenticated closure facts", async () => {
   const { r } = await setup();
   const a = await github(r);
   const p = raw(
@@ -527,7 +543,7 @@ it("suppresses own PR text without losing independently authenticated closure fa
     }),
   );
   await a.webhook(r, p, headers(p, "pull_request"));
-  expect(await r.list("trigger")).toHaveLength(0);
+  expect(await r.list("trigger")).toHaveLength(1);
   expect(
     await r.engine.store.read("sourceThreadState", "github:acme/repo#15"),
   ).toMatchObject({ state: "closed" });
@@ -682,7 +698,7 @@ it("closed-before-ready waits for current generation, every tracked PR, and regi
   await r.updatePolicy(
     {
       ...policy,
-      explicitCapabilities: ["repo.read", "channel.reply", "pr.create"],
+      explicitCapabilities: ["repo.read", "pr.create"],
     },
     operator,
     { commandId: "p" },
@@ -1023,4 +1039,586 @@ it("service config activates the existing local broker and rejects unknown envir
     expect(result.status).toBe(1);
     expect(result.stderr).toMatch(/environment/i);
   }
+});
+it.each([
+  [
+    "issue_comment",
+    "issues",
+    {
+      issue: { ...payload().issue },
+      comment: {
+        id: 100,
+        body: "Actual comment",
+        created_at: "2026-01-01T00:01:00Z",
+      },
+    },
+  ],
+  [
+    "pull_request_review_comment",
+    "pull_request",
+    {
+      issue: undefined,
+      pull_request: {
+        id: 5,
+        number: 5,
+        body: "PR text",
+        updated_at: "2026-01-01T00:00:00Z",
+      },
+      comment: {
+        id: 101,
+        body: "Review comment",
+        created_at: "2026-01-01T00:01:00Z",
+      },
+    },
+  ],
+  [
+    "pull_request_review",
+    "pull_request",
+    {
+      issue: undefined,
+      pull_request: {
+        id: 5,
+        number: 5,
+        body: "PR text",
+        updated_at: "2026-01-01T00:00:00Z",
+      },
+      review: { id: 102, body: "Review", submitted_at: "2026-01-01T00:01:00Z" },
+    },
+  ],
+])(
+  "rejects unsigned family substitution %s to %s for identical signed bytes",
+  async (event, alternate, shape) => {
+    const { r } = await setup();
+    const a = await github(r);
+    const p = raw(
+      payload({
+        ...shape,
+        action: event === "pull_request_review" ? "submitted" : "created",
+      }),
+    );
+    await a.webhook(r, p, headers(p, event, "original"));
+    await expect(
+      a.webhook(r, p, headers(p, alternate, "different-delivery")),
+    ).rejects.toThrow(/family|event|payload/i);
+    expect(await r.list("trigger")).toHaveLength(1);
+  },
+);
+it("preserves human feedback copying a public marker and a human reopening a marked PR", async () => {
+  const { r } = await setup();
+  const a = await github(r);
+  const comment = raw(
+    payload({
+      action: "created",
+      comment: {
+        id: 200,
+        user: { login: "alice", type: "User" },
+        body: "Human feedback quoting " + a.marker("public") + " please fix",
+        created_at: "2026-01-01T00:00:00Z",
+      },
+    }),
+  );
+  await a.webhook(r, comment, headers(comment, "issue_comment", "copy"));
+  const reopened = raw(
+    payload({
+      action: "reopened",
+      issue: undefined,
+      pull_request: {
+        id: 201,
+        number: 1,
+        state: "open",
+        body: a.marker("public"),
+        updated_at: "2026-01-01T00:01:00Z",
+      },
+    }),
+  );
+  await a.webhook(
+    r,
+    reopened,
+    headers(reopened, "pull_request", "human-reopen"),
+  );
+  expect(await r.list("trigger")).toHaveLength(2);
+  expect(
+    (await r.list<any>("trigger")).every((t) => t.actor.kind === "human"),
+  ).toBe(true);
+});
+it.each(["check_run", "check_suite", "status"])(
+  "CI family %s never reopens ended work even with a User sender",
+  async (event) => {
+    const { r } = await setup();
+    await r.updatePolicy(policy, operator, { commandId: "p" });
+    const a = await github(r, { addressed: true });
+    const p = raw(payload());
+    const received = await a.webhook(r, p, headers(p));
+    const c = (await r.listCandidates())[0];
+    await r.decide(
+      c.id,
+      c.epoch,
+      { kind: "accept", goal: "CI must not resume", ruleIds: [] },
+      { commandId: "accept" },
+    );
+    const [ticket] = await r.list<any>("ticket");
+    await r.engine.transaction((tx) =>
+      r.engine.authorization.acknowledgeInputInTransaction(
+        tx,
+        ticket.id,
+        (received as any).results[0].triggerId,
+        1,
+      ),
+    );
+    await r.endTicket(ticket.id, 1, { commandId: "end" });
+    const shape =
+      event === "status"
+        ? {
+            action: undefined,
+            id: 300,
+            sha: "abc",
+            state: "success",
+            context: "ci",
+            created_at: "2026-01-01T00:02:00Z",
+          }
+        : {
+            action: event === "check_suite" ? "completed" : "created",
+            [event]: {
+              id: 300,
+              status: "completed",
+              conclusion: "success",
+              pull_requests: [{ number: 1 }],
+              head_sha: "abc",
+            },
+          };
+    const ci = raw(payload({ issue: undefined, ...shape }));
+    await a.webhook(r, ci, headers(ci, event, "ci"));
+    expect((await r.readTicket<any>(ticket.id)).lifecycle).toBe("ended");
+    expect((await r.list<any>("trigger")).at(-1).actor).toMatchObject({
+      kind: "bot",
+      trusted: false,
+    });
+  },
+);
+it("receipt recovery searches recent comments first beyond one thousand old comments", async () => {
+  let marker = "";
+  const observed: string[] = [];
+  const fixture = createServer((req, res) => {
+    const url = new URL(req.url!, "http://localhost");
+    observed.push(req.url!);
+    const entries = Array.from({ length: 1001 }, (_, i) => ({
+      id: i + 1,
+      body: i === 1000 ? "Recent answer " + marker : "Old comment",
+    }));
+    if (
+      url.searchParams.get("sort") === "created" &&
+      url.searchParams.get("direction") === "desc"
+    )
+      entries.reverse();
+    const page = Number(url.searchParams.get("page") ?? 1);
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify(entries.slice((page - 1) * 100, page * 100)));
+  });
+  await new Promise<void>((resolve) => fixture.listen(0, "127.0.0.1", resolve));
+  resources.push(
+    () => new Promise<void>((resolve) => fixture.close(() => resolve())),
+  );
+  const { r } = await setup();
+  const a = await github(r, {
+    apiBase: `http://127.0.0.1:${(fixture.address() as any).port}`,
+  });
+  marker = a.marker("recent");
+  expect(await a.queryReceipt("recent")).toEqual({
+    status: "found",
+    receipt: { id: 1001 },
+  });
+  expect(observed[0]).toContain("sort=created");
+  expect(observed[0]).toContain("direction=desc");
+});
+it.each(["natural", "stop", "inspect", "inspect-unrelated", "restart"])(
+  "pending final answer holds natural completion through receipt lookup (%s)",
+  async (mode) => {
+    const { r, directory } = await setup();
+    await r.updatePolicy(policy, operator, { commandId: "p" });
+    const a = await github(r, { addressed: true });
+    const opened = raw(
+      payload({
+        issue: undefined,
+        pull_request: {
+          id: 400,
+          number: 1,
+          state: "open",
+          body: "Fix",
+          updated_at: "2026-01-01T00:00:00Z",
+        },
+      }),
+    );
+    await a.webhook(r, opened, headers(opened, "pull_request"));
+    const c = (await r.listCandidates())[0];
+    await r.decide(
+      c.id,
+      c.epoch,
+      { kind: "accept", goal: "Final answer", ruleIds: [] },
+      { commandId: "accept" },
+    );
+    const [t] = await r.list<any>("ticket");
+    await a.trackPullRequest(r, t.id, "acme/repo#1", { commandId: "track" });
+    const closed = raw(
+      payload({
+        action: "closed",
+        issue: undefined,
+        pull_request: {
+          id: 400,
+          number: 1,
+          state: "closed",
+          body: "Fix",
+          updated_at: "2026-01-01T00:01:00Z",
+        },
+      }),
+    );
+    await a.webhook(r, closed, headers(closed, "pull_request", "closed"));
+    await r.close();
+    const { createModels } = await import("@earendil-works/pi-ai/models");
+    const { fauxProvider, fauxAssistantMessage, fauxToolCall } = await import(
+      "@earendil-works/pi-ai/providers/faux"
+    );
+    const { until } = await import("./helpers/scheduling.js");
+    const faux = fauxProvider(),
+      models = createModels();
+    models.setProvider(faux.provider);
+    faux.setResponses(
+      Array.from({ length: 100 }, () => async (ctx: any) => {
+        if (ctx.messages.at(-1)?.role !== "user")
+          return fauxAssistantMessage("Done");
+        const user = ctx.messages.filter((m: any) => m.role === "user").at(-1);
+        const input = JSON.parse(
+          typeof user.content === "string"
+            ? user.content
+            : user.content[0].text,
+        );
+        if (!input.inputId) return fauxAssistantMessage("No decisions");
+        return fauxAssistantMessage(
+          fauxToolCall("report", {
+            reportId: input.inputId,
+            assignmentId: input.assignmentId,
+            epoch: input.epoch,
+            inputIds: [input.inputId],
+            status: "ready",
+            content: "Final review result",
+          }),
+          { stopReason: "toolUse" },
+        );
+      }),
+    );
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let lookups = 0,
+      receiptKnown = false;
+    const sends: string[] = [];
+    const adapter = {
+      sourceId: "github",
+      enabled: true,
+      listened: () => true,
+      queryReceipt: async () => {
+        lookups++;
+        await gate;
+        if (receiptKnown)
+          return { status: "found" as const, receipt: { id: "repaired" } };
+        if (mode.startsWith("inspect") && sends.length)
+          return { status: "unknown" as const };
+        return { status: "absent" as const };
+      },
+      send: async (message: any) => {
+        sends.push(message.id);
+        if (mode.startsWith("inspect")) throw new Error("Lost send response");
+        return { id: sends.length };
+      },
+    };
+    let active = await openSuperAgent({
+      directory,
+      models,
+      model: {
+        provider: faux.getModel().provider,
+        modelId: faux.getModel().id,
+      },
+      outbox: { adapters: [adapter] },
+    });
+    resources.push(async () => {
+      release();
+      await active.close();
+    });
+    await until(
+      async () =>
+        lookups > 0 &&
+        (await active.list<any>("deliveryRun")).every(
+          (run) => run.settled && run.consumed,
+        ),
+    );
+    await active.agents!.pump();
+    expect((await active.readTicket<any>(t.id)).lifecycle).toBe("open");
+    if (mode === "stop")
+      await active.stopTicket(t.id, operator, {
+        commandId: "stop-before-final-send",
+      });
+    if (mode === "restart") {
+      await active.agents!.close();
+      // Simulate process loss after the native terminal commit, before its host completion callback.
+      active.outbox.completed = async () => {};
+    }
+    release();
+    if (mode === "restart") {
+      await until(async () => {
+        const messages = await active.list<any>("outbox");
+        if (!messages.every((message) => message.status === "sent"))
+          return false;
+        for (const message of messages)
+          if (
+            (
+              await active.harness.getTask(
+                message.taskId,
+                active.engine.context,
+              )
+            )?.state.status !== "terminal"
+          )
+            return false;
+        return true;
+      });
+      expect((await active.readTicket<any>(t.id)).lifecycle).toBe("open");
+      await active.close();
+      active = await openSuperAgent({
+        directory,
+        outbox: { adapters: [adapter] },
+      });
+      expect(active.agents).toBeUndefined();
+      expect((await active.readTicket<any>(t.id)).lifecycle).toBe("ended");
+      expect(sends.length).toBe((await active.list("outbox")).length);
+    } else if (mode === "natural") {
+      await until(
+        async () => (await active.readTicket<any>(t.id)).lifecycle === "ended",
+      );
+      expect(sends.length).toBeGreaterThan(0);
+      expect(
+        (await active.list<any>("outbox")).every(
+          (message) => message.status === "sent",
+        ),
+      ).toBe(true);
+    } else if (mode.startsWith("inspect")) {
+      await active.agents!.waitForIdle();
+      expect((await active.readTicket<any>(t.id)).attention).toBe(
+        "Outbound message outcome uncertain",
+      );
+      await active.close();
+      active = await openSuperAgent({
+        directory,
+        outbox: { adapters: [adapter] },
+      });
+      expect(active.agents).toBeUndefined();
+      if (mode === "inspect-unrelated")
+        await active.engine.transaction(async (tx) => {
+          const ticket = await active.engine.store.get<any>(tx, "ticket", t.id);
+          await active.engine.store.put(tx, "ticket", t.id, {
+            ...ticket,
+            attention: "Independent operator diagnostic",
+          });
+        });
+      receiptKnown = true;
+      const messages = await active.list<any>("outbox");
+      for (let index = 0; index < messages.length; index++) {
+        expect(
+          (await active.outbox.inspectReceipt(messages[index].id)).status,
+        ).toBe("found");
+        if (index < messages.length - 1)
+          expect((await active.readTicket<any>(t.id)).lifecycle).toBe("open");
+      }
+      if (mode === "inspect-unrelated")
+        expect(await active.readTicket<any>(t.id)).toMatchObject({
+          lifecycle: "open",
+          attention: "Independent operator diagnostic",
+        });
+      else
+        expect(await active.readTicket<any>(t.id)).toMatchObject({
+          lifecycle: "ended",
+        });
+      expect(sends.length).toBe(messages.length);
+    } else {
+      await active.agents!.waitForIdle();
+      expect(sends).toEqual([]);
+      expect((await active.readTicket<any>(t.id)).lifecycle).toBe("stopped");
+    }
+  },
+);
+
+it.each([
+  { login: "agent[bot]", type: "Bot" },
+  { login: "agent-user", type: "User" },
+])(
+  "suppresses a configured own sender before POST receipt while preserving copied human feedback ($type)",
+  async (own) => {
+    let release!: () => void, accepted!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve)),
+      entered = new Promise<void>((resolve) => (accepted = resolve));
+    let published = "";
+    const fixture = createServer(async (req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.method === "POST") {
+        let body = "";
+        for await (const chunk of req) body += chunk;
+        published = JSON.parse(body).body;
+        accepted();
+        await gate;
+        res.statusCode = 201;
+        res.end(JSON.stringify({ id: 700 }));
+      } else res.end("[]");
+    });
+    await new Promise<void>((resolve) =>
+      fixture.listen(0, "127.0.0.1", resolve),
+    );
+    resources.push(
+      () =>
+        new Promise<void>((resolve) => {
+          fixture.closeAllConnections();
+          fixture.close(() => resolve());
+        }),
+    );
+    const a = new gh.GitHubSource({
+      repositories: ["acme/repo"],
+      webhookSecret: "secret",
+      addressed: true,
+      ownLogins: [own.login],
+      apiBase: `http://127.0.0.1:${(fixture.address() as any).port}`,
+    });
+    const { r } = await setup(undefined, { outbox: { adapters: [a] } });
+    resources.push(async () => {
+      release();
+      a.close();
+    });
+    await a.configure(r);
+    await r.updatePolicy(policy, operator, { commandId: "p" });
+    const p = raw(payload());
+    await a.webhook(r, p, headers(p));
+    const c = (await r.listCandidates())[0];
+    await r.decide(
+      c.id,
+      c.epoch,
+      { kind: "accept", goal: "Own echo", ruleIds: [] },
+      { commandId: "accept" },
+    );
+    const [t] = await r.list<any>("ticket");
+    await r.engine.transaction((tx) =>
+      r.outbox.enqueueMessage(tx, {
+        ticketId: t.id,
+        mandateId: t.mandateId,
+        assignmentEpoch: t.assignmentEpoch,
+        purpose: "answer",
+        destination: { sourceId: "github", threadRef: "acme/repo#1" },
+        payload: { content: "Ready result" },
+        idempotencyKey: "early-own-send",
+      }),
+    );
+    await entered;
+    const echo = raw(
+      payload({
+        action: "created",
+        sender: own,
+        comment: {
+          id: 700,
+          user: own,
+          body: published,
+          created_at: "2026-01-01T00:01:00Z",
+        },
+      }),
+    );
+    expect(
+      (await a.webhook(r, echo, headers(echo, "issue_comment", "early-echo")))
+        .results,
+    ).toEqual([]);
+    expect(await r.list("trigger")).toHaveLength(1);
+    const copied = raw(
+      payload({
+        action: "created",
+        comment: {
+          id: 701,
+          user: { login: "alice", type: "User" },
+          body: published,
+          created_at: "2026-01-01T00:01:01Z",
+        },
+      }),
+    );
+    await a.webhook(
+      r,
+      copied,
+      headers(copied, "issue_comment", "copied-by-human"),
+    );
+    expect(await r.list("trigger")).toHaveLength(2);
+    release();
+    const { until } = await import("./helpers/scheduling.js");
+    await until(
+      async () => (await r.list<any>("outbox"))[0]?.status === "sent",
+    );
+    expect(
+      (
+        await a.webhook(
+          r,
+          echo,
+          headers(echo, "issue_comment", "known-receipt-echo"),
+        )
+      ).results,
+    ).toEqual([]);
+    const edited = raw(
+      payload({
+        action: "edited",
+        comment: {
+          id: 700,
+          user: own,
+          body: published,
+          created_at: "2026-01-01T00:01:00Z",
+          updated_at: "2026-01-01T00:02:00Z",
+        },
+      }),
+    );
+    await a.webhook(r, edited, headers(edited, "issue_comment", "human-edit"));
+    expect(await r.list("trigger")).toHaveLength(3);
+    const copiedOwn = raw(
+      payload({
+        action: "created",
+        sender: own,
+        comment: {
+          id: 702,
+          user: own,
+          body: published,
+          created_at: "2026-01-01T00:03:00Z",
+        },
+      }),
+    );
+    await a.webhook(
+      r,
+      copiedOwn,
+      headers(copiedOwn, "issue_comment", "different-comment-entity"),
+    );
+    expect(await r.list("trigger")).toHaveLength(4);
+  },
+);
+it("outbound GitHub fails closed without a configured own login while receipt inspection remains available", async () => {
+  let posts = 0;
+  const fixture = createServer((req, res) => {
+    if (req.method === "POST") posts++;
+    res.setHeader("content-type", "application/json");
+    res.end("[]");
+  });
+  await new Promise<void>((resolve) => fixture.listen(0, "127.0.0.1", resolve));
+  resources.push(
+    () => new Promise<void>((resolve) => fixture.close(() => resolve())),
+  );
+  const { r } = await setup();
+  const a = await github(r, {
+    apiToken: "private",
+    apiBase: `http://127.0.0.1:${(fixture.address() as any).port}`,
+  });
+  await expect(
+    a.send(
+      {
+        destination: { sourceId: "github", threadRef: "acme/repo#1" },
+        payload: { content: "Reply" },
+        purpose: "answer",
+      } as any,
+      "key",
+    ),
+  ).rejects.toThrow(/own.*login/i);
+  expect(posts).toBe(0);
+  expect(await a.queryReceipt("key")).toEqual({ status: "unknown" });
 });

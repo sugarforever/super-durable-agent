@@ -277,6 +277,7 @@ export async function openSuperAgent(
         });
     });
     await reconcile(engine);
+    await engine.transaction(tx => engine.lifecycle.completeInTransaction(tx));
     await outbox.reconcile();
     // An explicit model activates execution. A model-free recovery keeps live
     // agent tasks durable and paused; domain receives/commands still commit.
