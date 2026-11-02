@@ -4,7 +4,7 @@ Each row corresponds to one requirement issue and one incremental PR. A PR targe
 
 | Part | Requirement | Issue | PR | Base | Checkpoint status |
 | --- | --- | --- | --- | --- | --- |
-| 1 | English architecture and executable design checkpoints | [#1](https://github.com/sugarforever/super-durable-agent/issues/1) | Pending | `main` | Planned |
+| 1 | English architecture and executable design checkpoints | [#1](https://github.com/sugarforever/super-durable-agent/issues/1) | [#11](https://github.com/sugarforever/super-durable-agent/pull/11) | `main` | Implemented; user approval pending |
 | 2 | Persistent domain kernel and single-writer runtime | [#2](https://github.com/sugarforever/super-durable-agent/issues/2) | Pending | `codex/01-design-baseline` | Planned |
 | 3 | Authorization and subscription ownership | [#3](https://github.com/sugarforever/super-durable-agent/issues/3) | Pending | `codex/02-domain-kernel` | Planned |
 | 4 | Router and Worker conversations with durable delivery | [#4](https://github.com/sugarforever/super-durable-agent/issues/4) | Pending | `codex/03-policy-ownership` | Planned |
@@ -30,3 +30,7 @@ The initial seven pi characterization probes pass on Node.js v26.8.1. They cover
 ## Review protocol
 
 Use the PR diff against its immediate base, not main, for incremental review. CI still runs the complete accumulated suite. If a lower PR changes, propagate the correction upward and rerun affected checks before requesting approval. Do not merge, close requirement issues, or enable auto-merge on the user’s behalf. After an approved predecessor merges, retarget/rebase the next PR as necessary and reverify.
+
+## Part 1 evidence
+
+Implementation commit `530303b` establishes the reviewed design baseline. `npm run verify:pi` passed all seven characterization probes; `node scripts/check-docs.mjs` passed six English documents and local links. Independent scoped review passed specification and quality checks with no important findings. This checkpoint records documentation/probe readiness, not runtime implementation. PR #11 remains unmerged and requires user approval.
