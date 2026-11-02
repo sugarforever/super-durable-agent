@@ -22,6 +22,7 @@ import {
   digest,
   type RuntimeMetadata,
 } from "../domain/model.js";
+import { operationDigest, type PreparedReceipt } from "../environments/types.js";
 import type { EnvironmentOptions } from "../services/jobs.js";
 import { preflightDocuments, inspectDocuments } from "./migrations.js";
 export interface EnvironmentDependency {
@@ -47,6 +48,7 @@ export interface BackupManifest {
   dependency?: EnvironmentDependency;
   external: ExternalFile[];
   workspaces: { cwd: string; repository: string; markerSha256: string }[];
+  releasedWorkspaces?: string[];
   inspectionOnly: boolean;
 }
 const hash = (bytes: Buffer) =>
@@ -155,24 +157,84 @@ async function captureDependencies(manifest: BackupManifest, target: string) {
       });
     }
   }
-  if (dep.kind === "local") {
-    for (const file of manifest.external.filter((f) =>
-      f.path.startsWith("dependencies/environments/"),
-    )) {
-      const descriptor = JSON.parse(await readFile(file.source, "utf8"));
-      const cwd = await realpath(descriptor.cwd),
-        repository = await realpath(dep.repository!);
-      const marker = await readFile(join(cwd, ".super-agent-environment.json"));
-      // Old lease descriptors are retained; only the physical current marker is a dependency.
-      if (!manifest.workspaces.some((w) => w.cwd === cwd))
-        manifest.workspaces.push({
-          cwd,
-          repository,
-          markerSha256: hash(marker),
-        });
+  if (dep.kind === "local") await captureLocalWorkspaces(manifest, target, source);
+}
+
+/** Immutable descriptors survive release. Only the latest lease for a physical
+ * workspace may establish its absence, with an exact, checksummed release receipt. */
+async function captureLocalWorkspaces(manifest: BackupManifest, target: string, source: string) {
+  const repository = await realpath(manifest.dependency!.repository!);
+  const descriptors = new Map<string, PreparedReceipt>();
+  const operations: any[] = [];
+  const pointers = new Map<string, string>();
+  for (const file of manifest.external) {
+    const path = relative("dependencies", file.path);
+    if (!/^(environments|operations|ticket-workspaces)\//.test(path)) continue;
+    const value = JSON.parse(await readFile(join(target, file.path), "utf8"));
+    if (path.startsWith("environments/")) {
+      const descriptor = value as PreparedReceipt;
+      if (descriptor.status !== "prepared" ||
+          descriptor.environmentId !== digest({ identity: descriptor.identity, repository }) ||
+          path !== join("environments", `${descriptor.environmentId}.json`) ||
+          (descriptor.repository !== undefined && descriptor.repository !== repository) ||
+          descriptor.cwd !== join(source, "worktrees", descriptor.workspaceId ?? descriptor.environmentId))
+        throw Error("Invalid historical workspace descriptor");
+      descriptors.set(descriptor.environmentId, descriptor);
+    } else if (path.startsWith("operations/")) {
+      const { checksum, ...record } = value;
+      const { request, receipt } = record;
+      if (!request || !receipt || checksum !== digest(record) ||
+          path !== join("operations", `${digest(request.operationId)}.json`) ||
+          request.operationId !== receipt.operationId || request.payloadDigest !== receipt.payloadDigest ||
+          request.payloadDigest !== operationDigest(request.identity, request.payload) ||
+          canonicalJson(request.identity) !== canonicalJson(receipt.identity))
+        throw Error("Endpoint receipt identity/integrity conflict");
+      operations.push(record);
+    } else {
+      if (value.checksum !== digest(value.value) || typeof value.value?.environmentId !== "string")
+        throw Error("Invalid current workspace lease pointer");
+      pointers.set(path, value.value.environmentId);
     }
   }
+  for (const [path, id] of pointers) {
+    const descriptor = descriptors.get(id);
+    if (!descriptor || path !== join("ticket-workspaces", `${digest(digest({ ticketId: descriptor.identity.ticketId, repository }))}.json`))
+      throw Error("Invalid current workspace lease pointer");
+  }
+  const groups = new Map<string, PreparedReceipt[]>();
+  for (const descriptor of descriptors.values()) {
+    const group = groups.get(descriptor.cwd) ?? [];
+    group.push(descriptor); groups.set(descriptor.cwd, group);
+  }
+  for (const [cwd, leases] of groups) {
+    leases.sort((a, b) => b.identity.epoch - a.identity.epoch);
+    const latest = leases[0];
+    if (leases.some(d => d.identity.ticketId !== latest.identity.ticketId) ||
+        leases.slice(1).some(d => d.identity.epoch >= latest.identity.epoch))
+      throw Error("Ambiguous historical workspace leases");
+    const released = operations.some(({ request, receipt }) =>
+      request.payload.kind === "release" && request.payload.environmentId === latest.environmentId &&
+      canonicalJson(request.identity) === canonicalJson(latest.identity) && receipt.status === "released");
+    if (released) {
+      if ([...pointers.values()].some(id => leases.some(d => d.environmentId === id)))
+        throw Error("Released workspace retains a current lease pointer");
+      await requireAbsentWorkspace(cwd);
+      (manifest.releasedWorkspaces ??= []).push(cwd);
+      continue;
+    }
+    if (await realpath(cwd) !== cwd) throw Error("Workspace identity changed");
+    const marker = await readFile(join(cwd, ".super-agent-environment.json"));
+    if (canonicalJson(JSON.parse(marker.toString("utf8"))) !== canonicalJson(latest))
+      throw Error("Current workspace lease marker conflict");
+    manifest.workspaces.push({ cwd, repository, markerSha256: hash(marker) });
+  }
 }
+async function requireAbsentWorkspace(cwd: string): Promise<void> {
+  try { await lstat(cwd); }
+  catch (error: any) { if (error.code === "ENOENT") return; throw error; }
+  throw Error("Released workspace path reappeared; reconciliation required");
+}
+
 /** Stop the service first. Takes the same permanent advisory writer lock as runtime startup. */
 export async function backupRuntime(
   directory: string,
@@ -325,6 +387,7 @@ export async function verifyBackup(directory: string): Promise<BackupManifest> {
   return manifest;
 }
 async function validateDependencies(manifest: BackupManifest): Promise<void> {
+  for (const cwd of manifest.releasedWorkspaces ?? []) await requireAbsentWorkspace(cwd);
   if (manifest.dependency?.directory) {
     const directory = await realpath(manifest.dependency.directory);
     const current: string[] = [];

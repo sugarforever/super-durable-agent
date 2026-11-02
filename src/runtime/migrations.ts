@@ -10,6 +10,7 @@ import {
   type StoredDocument,
 } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
+import { DOMAIN_RECORD_KINDS } from "../domain/store.js";
 import { canonicalJson, type RuntimeMetadata } from "../domain/model.js";
 /** Public storage scans only; no pi table names or private SQLite mutations. */
 export async function inspectDocuments(
@@ -48,22 +49,32 @@ export async function inspectDocuments(
   }
 }
 export async function preflightDocuments(storage: Storage): Promise<void> {
-  const versions = new Map(
-    [AgentDoc, InboxDoc, LiveDoc, ProviderDoc, UsageDoc].map((t) => [
-      t.definition.kind,
-      t.definition.version,
-    ]),
+  const definitions = new Map(
+    [AgentDoc, InboxDoc, LiveDoc, ProviderDoc, UsageDoc].map(t => [t.definition.kind, t.definition]),
   );
   await inspectDocuments(storage, (document) => {
-    const expected = document.record.kind.startsWith("sa.")
-      ? 1
-      : versions.get(document.record.kind);
-    if (expected === undefined || document.version !== expected)
-      throw Error(
-        `Unsupported Document definition/version: ${document.record.kind} v${document.version}`,
-      );
+    const { record, value } = document;
+    const family = record.kind.slice(3);
+    const domain = record.kind.startsWith("sa.") && (family === "index" || DOMAIN_RECORD_KINDS.has(family));
+    const native = definitions.get(record.kind);
+    let compatible = false;
+    if (domain) {
+      // DomainStore families are session-owned, keyed, and use a stable envelope.
+      // Payload semantics remain owned by the domain service, not a guessed schema.
+      compatible = document.version === 1 && record.scope.kind === "session" &&
+        typeof record.key === "string" && record.key.length > 0 &&
+        (family === "index"
+          ? DOMAIN_RECORD_KINDS.has(record.key) && Array.isArray(value.ids) && value.ids.every(id => typeof id === "string")
+          : typeof value.present === "boolean" && Object.hasOwn(value, "value") &&
+            (value.present || value.value === null));
+    } else if (native) {
+      compatible = document.version === native.version && record.scope.kind === native.scope &&
+        record.key === undefined && record.history === native.history && record.fork === native.fork;
+    }
+    if (!compatible) throw Error(`Unsupported Document definition/version: ${record.kind} v${document.version}`);
   });
 }
+
 export function compatibleMigration(
   previous: RuntimeMetadata,
   snapshot: RegistrySnapshot,

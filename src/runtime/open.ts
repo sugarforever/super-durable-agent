@@ -278,6 +278,13 @@ export async function openSuperAgent(
         });
     });
     const broker=coordinator.jobs.broker;
+    if (broker instanceof LocalEnvironmentBroker) {
+      const previous = await store.read<EnvironmentDependency>('metadata', 'environment');
+      // Establish the empty inventory before publishing metadata. Once published,
+      // absence is lost history, never a reason to recreate a broker directory.
+      if (!previous && !(await store.list('job')).length) await mkdir(broker.directory, { recursive: true, mode: 0o700 });
+      if (await realpath(broker.directory) !== broker.directory) throw Error('Original endpoint dependency path changed');
+    }
     const dependency:EnvironmentDependency|undefined=broker instanceof LocalEnvironmentBroker
       ? {kind:'local',directory:broker.directory,repository:await realpath(broker.options.repository)}
       : broker instanceof RemoteEnvironmentBroker

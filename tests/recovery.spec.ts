@@ -373,22 +373,17 @@ it("migrates an actually executed native checkpoint and rejects incompatible Doc
   expect(count).toBe(1);
 });
 it("refuses missing artifacts referenced by a conversation Document before completing a backup", async () => {
-  const { defineDoc } = await import("@earendil-works/pi-durable");
-  const home = await root(),
-    directory = join(home, "primary");
-  const r = await openSuperAgent({ directory });
-  const doc = defineDoc({
-    kind: "sa.conversationArtifact",
-    version: 1,
-    scope: "conversation",
-    history: "latest",
-    fork: "initial",
-    initial: () => ({ artifact: "0".repeat(64) }),
+  const { InboxDoc } = await import("@earendil-works/pi-durable");
+  const home = await root(), directory = join(home, "primary");
+  const r = await openSuperAgent({ directory, startPaused: true });
+  // Native queued passive-write context can contain arbitrary host entry data.
+  await r.engine.transaction(async tx => {
+    const inbox = await tx.doc(InboxDoc, r.control.id);
+    inbox.items.push({ id: 1 as any, mode: "write", entry: { kind: "fixture.artifact", data: { artifact: "0".repeat(64) } } });
   });
-  await r.engine.transaction((tx) => tx.doc(doc, r.control.id));
   await r.close();
   await expect(offlineBackup(directory, join(home, "backup"))).rejects.toThrow(
-    /artifact|rejected|failed/i,
+    /Referenced artifact is missing/i,
   );
   await expect(
     readFile(join(home, "backup", "manifest.json")),
@@ -485,3 +480,93 @@ it("refuses restored activation after the original broker ledger gains a post-ba
     "post-backup",
   );
 });
+
+it.each(["session", "conversation", "task"] as const)(
+  "rejects unknown sa version-one Documents in %s scope before a runnable Task effect",
+  async (scope) => {
+    const { defineDoc } = await import("@earendil-works/pi-durable");
+    const directory = await root();
+    let effects = 0;
+    const task = checkpointTask(1, undefined, () => effects++);
+    const extensions = [defineExtension({ name: "test.extension", tasks: [task] })];
+    const r = await openSuperAgent({ directory, startPaused: true, extensions });
+    await r.engine.transaction(async (tx) => {
+      const id = await tx.createTask(task, {}, { ownership: { kind: "conversation" }, background: true });
+      const doc = defineDoc({ kind: "sa.unknownFutureDefinition", version: 1,
+        ...(scope === "conversation" ? { scope, history: "latest", fork: "initial" } as const : { scope }),
+        initial: () => ({ value: 1 }) } as any);
+      await (tx.doc as any)(doc, scope === "task" ? id : scope === "conversation" ? r.control.id : undefined);
+    });
+    await r.close();
+    await expect(openSuperAgent({ directory, extensions }).then(async (opened) => { await opened.close(); }))
+      .rejects.toThrow(/Unsupported Document definition\/version: sa.unknownFutureDefinition/);
+    expect(effects).toBe(0);
+  },
+);
+
+async function localRecoveryFixture() {
+  const { promisify } = await import("node:util");
+  const { execFile } = await import("node:child_process");
+  const { LocalEnvironmentBroker } = await import("../src/environments/local.js");
+  const { operationDigest } = await import("../src/environments/types.js");
+  const git = promisify(execFile), home = await root(), repository = join(home, "repo"), directory = join(home, "primary"), endpoint = join(home, "endpoint");
+  await mkdir(repository);
+  await git("git", ["init", "-b", "main", repository]);
+  await git("git", ["-C", repository, "config", "user.name", "Recovery"]);
+  await git("git", ["-C", repository, "config", "user.email", "recovery@example.invalid"]);
+  await writeFile(join(repository, "file"), "base");
+  await git("git", ["-C", repository, "add", "."]);
+  await git("git", ["-C", repository, "commit", "-m", "base"]);
+  const environment = { directory: endpoint, repository };
+  const broker = new LocalEnvironmentBroker({ ...environment, authorize: async identity => ({ ...identity, capabilities: ["repo.read", "repo.write"] }) });
+  async function prepare(epoch: number) {
+    const identity = { ticketId: "t", assignmentId: `a${epoch}`, epoch, mandateId: "m" }, payload = { kind: "prepare" as const };
+    return broker.prepare({ operationId: `prepare:${epoch}`, identity, payload, payloadDigest: operationDigest(identity, payload) });
+  }
+  return { home, directory, endpoint, environment, broker, prepare };
+}
+
+it.each([1, 3])("backs up and restores retained release history after %i workspace leases", async (epochs) => {
+  const { restoreRuntime, verifyBackup } = await import("../src/runtime/backup.js");
+  const f = await localRecoveryFixture();
+  const leases = [];
+  for (let epoch = 1; epoch <= epochs; epoch++) leases.push(await f.prepare(epoch));
+  const latest = leases.at(-1)!;
+  expect(new Set(leases.map(p => p.cwd)).size).toBe(1);
+  expect(await f.broker.release(latest.environmentId, "release")).toMatchObject({ status: "released" });
+  const r = await openSuperAgent({ directory: f.directory, environment: f.environment });
+  await r.close();
+  const archive = join(f.home, "archive");
+  await offlineBackup(f.directory, archive);
+  const manifest = await verifyBackup(archive);
+  expect(manifest.workspaces).toEqual([]);
+  expect(manifest.external.filter(x => x.path.startsWith("dependencies/environments/"))).toHaveLength(epochs);
+  expect(manifest.external.filter(x => x.path.startsWith("dependencies/operations/"))).toHaveLength(epochs + 1);
+  const restored = join(f.home, "restored");
+  await restoreRuntime(archive, restored);
+  const reopened = await openSuperAgent({ directory: restored, environment: f.environment });
+  await reopened.close();
+  expect(await f.broker.release(latest.environmentId, "release")).toMatchObject({ status: "released" });
+  // A confirmed release of a different physical workspace cannot excuse this loss.
+  const retained = await f.prepare(epochs + 1);
+  await rm(retained.cwd, { recursive: true });
+  await expect(offlineBackup(f.directory, join(f.home, "missing-workspace"))).rejects.toThrow(/ENOENT|workspace/i);
+}, 15000);
+
+it("backs up a safely unused configured local endpoint and activates the restored primary without recreating missing history", async () => {
+  const { restoreRuntime, verifyBackup } = await import("../src/runtime/backup.js");
+  const f = await localRecoveryFixture();
+  const r = await openSuperAgent({ directory: f.directory, environment: f.environment });
+  await r.close();
+  const archive = join(f.home, "archive");
+  await offlineBackup(f.directory, archive);
+  expect((await verifyBackup(archive)).external).toEqual([]);
+  const restored = join(f.home, "restored");
+  await restoreRuntime(archive, restored);
+  const reopened = await openSuperAgent({ directory: restored, environment: f.environment });
+  await reopened.close();
+  await f.prepare(1);
+  await rm(f.endpoint, { recursive: true });
+  await expect(offlineBackup(f.directory, join(f.home, "missing-ledger"))).rejects.toThrow(/ENOENT|endpoint|dependency/i);
+  await expect(openSuperAgent({ directory: f.directory, environment: f.environment }).then(async opened => { await opened.close(); })).rejects.toThrow(/ENOENT|endpoint|dependency/i);
+}, 15000);
