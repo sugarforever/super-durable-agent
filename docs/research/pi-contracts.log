@@ -1,0 +1,11 @@
+
+> super-durable-agent@0.0.0 verify:pi
+> node scripts/verify-pi-contracts.mjs
+
+PASS: domain document and execution intent roll back together
+PASS: repeated requestId produces one submission and one entry
+PASS: background anchor and worker survive ordinary Router abort
+PASS: explicit background abort stops execution but does not rewrite Ticket state
+PASS: ownerless Worker execution survives Router-wide abort and stops independently
+PASS: SQLite recovers after SIGKILL at the committed phase without replaying prepare
+PASS: submission deduplication survives reopening SQLite
