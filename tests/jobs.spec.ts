@@ -394,3 +394,44 @@ it('verifies legacy prepared descriptors against the canonical repository withou
   expect(await readFile(descriptorPath, 'utf8')).toBe(canonicalJson(receipt));
   expect(await readFile(markerPath, 'utf8')).toBe(canonicalJson(receipt));
 });
+
+describe('Ticket workspace continuity',()=>{
+ it('preserves commits and dirty files across fresh Assignment authority and fences old leases',async()=>{
+   const f=await repo({trustedLocalShell:true});
+   await writeFile(join(f.prepared.cwd,'source.txt'),'committed work');
+   await run('git',['-C',f.prepared.cwd,'add','source.txt']);
+   await run('git',['-C',f.prepared.cwd,'commit','-m','worker change']);
+   const head=(await run('git',['-C',f.prepared.cwd,'rev-parse','HEAD'])).stdout.trim();
+   await writeFile(join(f.prepared.cwd,'dirty.txt'),'unsaved work');
+   const next={...identity,assignmentId:'resumed',epoch:2,mandateId:'fresh'};
+   f.configuration.authorize=async(i:any)=>({...i,capabilities:['repo.read','repo.write','command.execute']});
+   const payload={kind:'prepare' as const};
+   const prepared=await f.broker.prepare({operationId:'prepare-next',identity:next,payload,payloadDigest:operationDigest(next,payload)});
+   expect(prepared.cwd).toBe(f.prepared.cwd);
+   expect(prepared.environmentId).not.toBe(f.prepared.environmentId);
+   expect((await run('git',['-C',prepared.cwd,'rev-parse','HEAD'])).stdout.trim()).toBe(head);
+   expect(await readFile(join(prepared.cwd,'dirty.txt'),'utf8')).toBe('unsaved work');
+   await expect(f.broker.release(f.prepared.environmentId,'old-release')).rejects.toThrow();
+   await expect(f.broker.execute(f.request('old-write',{kind:'write',path:'dirty.txt',text:'bad'}))).rejects.toThrow();
+   expect(await f.broker.query('prepare')).toEqual(f.prepared);
+   const p={kind:'write' as const,environmentId:prepared.environmentId,path:'fresh.txt',text:'new authority'};
+   expect(await f.broker.execute({operationId:'fresh-write',identity:next,payload:p,payloadDigest:operationDigest(next,p)})).toMatchObject({status:'completed'});
+ });
+});
+
+it('preserves existing modes through atomic structured writes and edits without following symlinks', async () => {
+  const { chmod, stat } = await import('node:fs/promises');
+  const f = await repo();
+  for (const kind of ['write', 'edit'] as const) for (const mode of [0o755, 0o640]) {
+    const path = `${kind}-${mode}`; await writeFile(join(f.prepared.cwd, path), 'original'); await chmod(join(f.prepared.cwd, path), mode);
+    const action = kind === 'write' ? { kind, path, text: 'updated' } : { kind, path, oldText: 'original', newText: 'updated' };
+    expect(await f.broker.execute(f.request(path, action))).toMatchObject({ status: 'completed' });
+    expect((await stat(join(f.prepared.cwd, path))).mode & 0o777).toBe(mode);
+    expect(await readFile(join(f.prepared.cwd, path), 'utf8')).toBe('updated');
+  }
+  expect(await f.broker.execute(f.request('new-conservative', { kind: 'write', path: 'new-conservative', text: 'new' }))).toMatchObject({ status: 'completed' });
+  expect((await stat(join(f.prepared.cwd, 'new-conservative'))).mode & 0o777).toBe(0o600);
+  await symlink(join(f.prepared.cwd, 'source.txt'), join(f.prepared.cwd, 'linked'));
+  for (const kind of ['write', 'edit']) await expect(f.broker.execute(f.request(`linked-${kind}`, { kind, path: 'linked', text: 'unsafe', oldText: 'original', newText: 'unsafe' }))).rejects.toThrow(/symlink/);
+  expect(await readFile(join(f.prepared.cwd, 'source.txt'), 'utf8')).toBe('original');
+});

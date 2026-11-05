@@ -5,6 +5,7 @@ import { join, resolve, relative, dirname, isAbsolute, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
+import { JsonLedger } from '../daemon/protocol.js';
 import { digest, canonicalJson } from '../domain/model.js';
 import { operationDigest, type EndpointAuthorizer, type EndpointIdentity, type EnvironmentBroker, type PrepareRequest, type PreparedReceipt, type PreparationReceipt, type ExecuteRequest, type ExecutionReceipt, type BrokerReceipt, type LifecycleReceipt, type ReceiptIdentity, type EndpointAction } from './types.js';
 const git = promisify(execFile);
@@ -83,7 +84,7 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
     await this.ready();
     const identity = this.identity(request);
     await this.authorize(request.identity, 'prepare', 'repo.read');
-    return this.serial(this.file(request.operationId), async () => {
+    return this.serial(join(this.directory, `ticket:${request.identity.ticketId}`), async () => {
       const repository = await realpath(this.options.repository);
       const gitCommonDirectory = await this.commonDirectory(repository);
       const environmentId = digest({ identity: request.identity, repository });
@@ -94,6 +95,37 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
         const checkpoint = previous.receipt as PreparationReceipt;
         if (checkpoint.environmentId !== environmentId || (checkpoint.repository !== undefined && checkpoint.repository !== repository) || (checkpoint.gitCommonDirectory !== undefined && checkpoint.gitCommonDirectory !== gitCommonDirectory)) throw new Error('Prepared repository identity conflict');
         // Preparation can safely inspect its deterministic marker/git state below.
+      }
+      const pointers = new JsonLedger<{environmentId:string}>(join(this.directory, 'ticket-workspaces'));
+      const pointerKey = digest({ticketId:request.identity.ticketId,repository});
+      let pointer = await pointers.read(pointerKey);
+      if (!pointer) {
+        // Adopt a single compatible retained legacy lease; ambiguity needs operator inspection.
+        const names = await readdir(join(this.directory,'environments')).catch((e:any)=>{if(e.code==='ENOENT')return [];throw e;});
+        const candidates:PreparedReceipt[]=[];
+        for(const name of names) {
+          const descriptor=JSON.parse(await readFile(join(this.directory,'environments',name),'utf8')) as PreparedReceipt;
+          if(descriptor.identity.ticketId===request.identity.ticketId) {
+            try {await this.environment(descriptor.environmentId,descriptor.identity);candidates.push(descriptor);}
+            catch(error:any) {if(error.code!=='ENOENT')throw error;}
+          }
+        }
+        if(candidates.length>1)throw Error('Ambiguous retained Ticket workspaces');
+        if(candidates.length)pointer={environmentId:candidates[0].environmentId};
+      }
+      if(pointer && pointer.environmentId!==environmentId) {
+        const prior=await this.environment(pointer.environmentId,JSON.parse(await readFile(join(this.directory,'environments',`${pointer.environmentId}.json`),'utf8')).identity);
+        if(prior.identity.epoch>=request.identity.epoch)throw Error('Workspace lease epoch conflict');
+        if(request.payload.baseCommit!==undefined && (await git('git',['-C',repository,'rev-parse','--verify',`${request.payload.baseCommit}^{commit}`])).stdout.trim()!==prior.baseCommit)throw Error('Retained workspace base conflict');
+        await this.requireQuiescent(prior.environmentId);
+        const receipt:PreparedReceipt={...identity,status:'prepared',environmentId,cwd:prior.cwd,baseCommit:prior.baseCommit,repository,gitCommonDirectory,workspaceId:prior.workspaceId??prior.environmentId};
+        if(!previous)await this.atomic(this.file(request.operationId),{request,receipt:{...receipt,status:'unknown',reason:'Workspace lease transfer admitted'}},true);
+        // The marker switches physical authority; old descriptors remain immutable accounting history.
+        await this.atomic(join(prior.cwd,MARKER),receipt);
+        await this.atomic(join(this.directory,'environments',`${environmentId}.json`),receipt,true);
+        await pointers.write(pointerKey,{environmentId});
+        await this.atomic(this.file(request.operationId),{request,receipt});
+        return receipt;
       }
       const cwd = join(this.directory, 'worktrees', environmentId);
       const admitted = previous?.receipt as PreparationReceipt | undefined;
@@ -124,8 +156,18 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
       }
       await this.atomic(join(this.directory, 'environments', `${environmentId}.json`), receipt, true);
       await this.atomic(this.file(request.operationId), { request, receipt });
+      await pointers.write(pointerKey,{environmentId});
       return receipt;
     });
+  }
+  private async requireQuiescent(environmentId:string):Promise<void> {
+    if ([...active.values()].some(x=>x.request.payload.environmentId===environmentId))throw Error('Environment has active operations');
+    for(const name of await readdir(join(this.directory,'operations'))) {
+      if(!name.endsWith('.json'))continue;
+      const saved=JSON.parse(await readFile(join(this.directory,'operations',name),'utf8')) as Ledger;
+      const record=await this.read(saved.request.operationId);
+      if(record && ['shell','read','write','edit'].includes((record.request.payload as any).kind) && (record.request.payload as any).environmentId===environmentId && ['running','cancelPending','unknown'].includes(record.receipt.status))throw Error('Environment has running or unknown operations');
+    }
   }
   private async verifyWorktree(repository: string, cwd: string, baseCommit: string): Promise<void> {
     if ((await lstat(cwd)).isSymbolicLink() || await realpath(cwd) !== cwd) throw new Error('Worktree path escape');
@@ -147,7 +189,7 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
       (descriptor.gitCommonDirectory !== undefined && descriptor.gitCommonDirectory !== gitCommonDirectory)) throw new Error('Prepared repository identity conflict');
     if (canonicalJson(descriptor.identity) !== canonicalJson(identity)) throw new Error('Unrelated environment identity');
     const cwd = await realpath(descriptor.cwd);
-    if (cwd !== descriptor.cwd || cwd !== join(this.directory, 'worktrees', environmentId)) throw new Error('Environment path escape');
+    if (cwd !== descriptor.cwd || cwd !== join(this.directory, 'worktrees', descriptor.workspaceId ?? environmentId)) throw new Error('Environment path escape');
     const marker = JSON.parse(await readFile(join(cwd, MARKER), 'utf8'));
     if (canonicalJson(marker) !== canonicalJson(descriptor)) throw new Error('Environment marker conflict');
     // Normal reuse allows user commits/branches and uncommitted edits. Bind the
@@ -249,9 +291,12 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
           if (Buffer.byteLength(text) > FILE_LIMIT) throw new Error('Structured write exceeds byte limit');
           // Validate again immediately before the atomic replacement. Never follow target symlinks.
           await this.path(environment.cwd, p.path);
+          let mode = 0o600;
+          try { mode = (await lstat(target!)).mode & 0o777; }
+          catch (error: any) { if (error.code !== 'ENOENT') throw error; }
           const temp = join(dirname(target!), `.sa-write-${randomUUID()}`);
           const handle = await open(temp, 'wx', 0o600);
-          try { await handle.writeFile(text); await handle.sync(); } finally { await handle.close(); }
+          try { await handle.writeFile(text); await handle.chmod(mode); await handle.sync(); } finally { await handle.close(); }
           try { await this.path(environment.cwd, p.path); await rename(temp, target!); }
           finally { await unlink(temp).catch(() => {}); }
           receipt = { ...identity, status: 'completed', result: { bytes: Buffer.byteLength(text) } };
@@ -355,8 +400,21 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
       return record.receipt;
     });
   }
-  async cancel(operationId: string, epoch: number): Promise<ExecutionReceipt> {
+  async cancel(operationId: string, epoch: number, target?: ExecuteRequest): Promise<ExecutionReceipt> {
     await this.ready();
+    if (target) {
+      this.identity(target);
+      if (target.operationId !== operationId || target.identity.epoch !== epoch || !['shell','read','write','edit'].includes(target.payload.kind)) throw new Error('Cancellation target conflict');
+      await this.authorize(target.identity, 'cancel');
+      await this.serial(this.file(operationId), async () => {
+        const previous = await this.read(operationId);
+        if (previous) { this.conflict(previous, target); return; }
+        const pending = active.get(this.file(operationId));
+        if (pending) { this.conflict({request: pending.request, receipt: {} as BrokerReceipt}, target); pending.cancelling = true; }
+        // A terminal admission tombstone also fences a delayed execute after process restart.
+        await this.atomic(this.file(operationId), {request: target, receipt: {...this.identity(target), status: 'cancelled', reason: 'Cancelled before admission'}}, true);
+      });
+    }
     const live = active.get(this.file(operationId));
     const record = await this.read(operationId) ?? (live ? { request: live.request, receipt: { ...this.identity(live.request), status: 'running' as const } } : undefined);
     if (!record || record.request.identity.epoch !== epoch) throw new Error('Cancellation operation epoch conflict');
@@ -389,7 +447,7 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
     const releaseKey = join(this.directory, environmentId);
     if (releasing.has(releaseKey)) throw new Error('Environment release is in progress');
     releasing.add(releaseKey);
-    try { return await this.serial(this.file(operationId), async () => {
+    try { return await this.serial(join(this.directory, `ticket:${descriptor.identity.ticketId}`), () => this.serial(this.file(operationId), async () => {
       const previous = await this.read(operationId); if (previous) { this.conflict(previous, request); return previous.receipt as LifecycleReceipt; }
       if ([...active.values()].some(x => x.request.payload.environmentId === environmentId)) throw new Error('Environment has active operations');
       for (const name of await readdir(join(this.directory, 'operations'))) {
@@ -405,8 +463,9 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
       await unlink(join(descriptor.cwd, MARKER));
       try { await git('git', ['-C', this.options.repository, 'worktree', 'remove', descriptor.cwd]); }
       catch (error) { await this.atomic(join(descriptor.cwd, MARKER), descriptor, true); throw error; }
+      await unlink(new JsonLedger(join(this.directory,'ticket-workspaces')).path(digest({ticketId:descriptor.identity.ticketId,repository:await realpath(this.options.repository)}))).catch((e:any)=>{if(e.code!=='ENOENT')throw e;});
       const result: LifecycleReceipt = { ...receipt, status: 'released' };
       await this.atomic(this.file(operationId), { request, receipt: result }); return result;
-    }); } finally { releasing.delete(releaseKey); }
+    })); } finally { releasing.delete(releaseKey); }
   }
 }

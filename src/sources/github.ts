@@ -178,7 +178,7 @@ export class GitHubSource implements SourceAdapter {
       "Unsupported or ambiguous GitHub payload family",
     );
   }
-  private render(message: Readonly<OutboundMessage>, key: string): string {
+  private render(message: Readonly<OutboundMessage>, key: string, includeQuestions = true): string {
     const payload = message.payload as any;
     const content =
       typeof payload === "string"
@@ -186,7 +186,12 @@ export class GitHubSource implements SourceAdapter {
         : typeof payload?.content === "string"
           ? payload.content
           : JSON.stringify(payload);
-    return `## Agent ${message.purpose}\n\n${content}\n\n${this.marker(key)}`;
+    const questions = includeQuestions && Array.isArray(payload?.questions) ? payload.questions.map((question: any) => {
+      if (typeof question === 'string') return question;
+      const options = Array.isArray(question.options) ? question.options.map((option: string) => `- ${option}`).join('\n') : '';
+      return [question.text, options].filter(Boolean).join('\n');
+    }).join('\n\n') : '';
+    return `## Agent ${message.purpose}\n\n${[content, questions].filter(Boolean).join('\n\n')}\n\n${this.marker(key)}`;
   }
   private async ownEcho(
     runtime: SuperAgentRuntime,
@@ -217,7 +222,9 @@ export class GitHubSource implements SourceAdapter {
             ["pending", "queued", "sending", "retrying", "uncertain"].includes(
               message.status,
             ))) &&
-        comment.body === this.render(message, message.idempotencyKey)
+        // Delayed echoes can contain the exact format used before questions were rendered.
+        (comment.body === this.render(message, message.idempotencyKey) ||
+          comment.body === this.render(message, message.idempotencyKey, false))
       );
     });
   }

@@ -4,16 +4,19 @@ import { canonicalJson, scopedId, type Ticket, type Mandate, type Policy, type S
 import { trackExecution, recordExecutionReceipt, type ExecutionAccounting } from '../runtime/reconcile.js';
 import { LocalEnvironmentBroker } from '../environments/local.js';
 import { UncertainEnvironmentError, operationDigest, type EndpointIdentity, type EndpointGrant, type EndpointAction, type EnvironmentBroker, type ExecutionPayload, type ExecutionReceipt, type PreparedReceipt } from '../environments/types.js';
+import { JobReceipts } from './job-receipts.js';
 import { createJobTask } from '../durable/tasks/job.js';
 import type { CancellationHandler } from './cancellation.js';
 export type EnvironmentOptions = { repository: string; directory?: string; trustedLocalShell?: boolean } | { broker: EnvironmentBroker };
 export interface StartJob { assignmentId: string; epoch: number; command: string; sandbox?: boolean }
 export interface Job extends ExecutionAccounting {
   identity: EndpointIdentity; operationId: string; commandDigest: string; action: { kind: 'shell'; command: string; sandbox?: boolean };
-  taskId: TaskId<null>; preparationOperationId?: string; environmentId?: string; payloadDigest?: string; payload?: ExecutionPayload; receipt?: ExecutionReceipt; notified?: boolean;
+  taskId: TaskId<null>; preparationOperationId?: string; environmentId?: string; payloadDigest?: string; payload?: ExecutionPayload; receipt?: ExecutionReceipt; notified?: boolean; notifiedStatus?: ExecutionReceipt["status"];
+  receiptTaskId?: TaskId<null>; receiptQueryAttempts?: number; receiptQueryAt?: number;
 }
 export class Jobs {
   readonly task = createJobTask(this);
+  readonly receipts = new JobReceipts(this);
   readonly broker?: EnvironmentBroker;
   constructor(readonly engine: Engine, options: EnvironmentOptions | undefined, directory: string, readonly kick: () => void) {
     this.broker = options && ('broker' in options ? options.broker : new LocalEnvironmentBroker({ ...options, directory: options.directory ?? directory, authorize: (identity, action) => this.authorize(identity, action) }));
@@ -145,28 +148,47 @@ export class Jobs {
     const job = await this.engine.store.read<Job>('job', id);
     if (!job || ['completed','failed','cancelled'].includes(job.status)) return;
     const prior = await this.endpoint().query(job.operationId);
-    if (prior) await this.finish(id, await this.endpoint().cancel(job.operationId, job.epoch));
-    else {
-      // No endpoint admission and the native task is being aborted: no external command was launched.
+    if (prior || job.payload && job.payloadDigest) {
+      const target = job.payload && job.payloadDigest ? { operationId: job.operationId, identity: job.identity,
+        payload: job.payload, payloadDigest: job.payloadDigest } : undefined;
+      await this.finish(id, await this.endpoint().cancel(job.operationId, job.epoch, target));
+    } else {
+      // No execute payload was committed. run() must recheck this terminal status
+      // before it can commit a payload or call the endpoint after preparation.
       await this.finish(id, { operationId: job.operationId, identity: job.identity, payloadDigest: job.payloadDigest ?? job.commandDigest, status: 'cancelled', reason: 'Cancelled before endpoint admission' });
     }
   }
-  async finish(id: string, receipt: ExecutionReceipt): Promise<void> {
+  async finish(id: string, receipt: ExecutionReceipt, receiptTaskId?: TaskId<null>): Promise<void> {
     if (!['completed','failed','cancelled','unknown'].includes(receipt.status)) return;
     await this.engine.transaction(async tx => {
       const { store } = this.engine;
       const job = await store.get<Job>(tx, 'job', id);
+      if (receiptTaskId !== undefined && job?.receiptTaskId !== receiptTaskId) return;
       if (!job || job.operationId !== receipt.operationId || canonicalJson(job.identity) !== canonicalJson(receipt.identity) || (job.payloadDigest ?? job.commandDigest) !== receipt.payloadDigest) throw new Error('Job receipt payload conflict');
       if (['completed','failed','cancelled'].includes(job.status)) return;
       await recordExecutionReceipt(this.engine, tx, { ...job, status: receipt.status as ExecutionAccounting['status'] });
       const next = (await store.get<Job>(tx, 'job', id))!;
       const ticket = await store.get<Ticket>(tx, 'ticket', job.ticketId);
-      const current = ticket?.lifecycle === 'open' && ticket.assignmentId === job.assignmentId && ticket.assignmentEpoch === job.epoch && !ticket.cancelPending;
-      await store.put(tx, 'job', id, { ...next, receipt, notified: job.notified || current });
-      if (current && !job.notified) {
-        const noteId = `job-result:${id}`;
+      const current = ticket?.lifecycle === 'open' && ticket.assignmentId === job.assignmentId && ticket.assignmentEpoch === job.epoch && ticket.mandateId === job.identity.mandateId && !ticket.cancelPending;
+      const previouslyNotified = job.notifiedStatus ?? (job.notified ? job.receipt?.status : undefined);
+      const notify = current && previouslyNotified !== receipt.status;
+      await store.put(tx, 'job', id, { ...next, receipt, notified: job.notified || current,
+        ...(notify ? { notifiedStatus: receipt.status } : {}) });
+      if (notify) {
+        const noteId = job.notified ? `job-result:${id}:${receipt.status}` : `job-result:${id}`;
         await store.put(tx, 'workerNote', noteId, { id: noteId, ticketId: job.ticketId, jobId: id, epoch: job.epoch, status: 'pending', text: canonicalJson({ kind: 'job_result', jobId: id, receipt }) });
-        if (receipt.status === 'unknown') await store.put(tx, 'ticket', ticket!.id, { ...ticket!, attention: 'Job outcome unknown; inspect endpoint before continuing' });
+      }
+      const attention = 'Job outcome unknown; inspect endpoint before continuing';
+      if (current && receipt.status === 'unknown' && !ticket!.attention)
+        await store.put(tx, 'ticket', ticket!.id, { ...ticket!, attention });
+      else if (current && receipt.status !== 'unknown' && ticket!.attention === attention) {
+        const unresolved = (await store.listInTransaction<Job>(tx, 'job')).some(other =>
+          other.id !== id && other.ticketId === job.ticketId && other.assignmentId === job.assignmentId &&
+          other.epoch === job.epoch && other.status === 'unknown');
+        if (!unresolved) {
+          const { attention: _resolved, ...rest } = ticket!;
+          await store.put(tx, 'ticket', ticket!.id, rest);
+        }
       }
     });
     this.kick();

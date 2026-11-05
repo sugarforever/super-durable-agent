@@ -171,7 +171,12 @@ export class RemoteDaemon {
     }
     if (action === "cancel") {
       const target = body.targetOperationId;
-      const original = await this.broker.query(target);
+      const observed = await this.broker.query(target);
+      const supplied = body.target;
+      if (supplied && (supplied.operationId !== target || supplied.identity?.epoch !== body.epoch || operationDigest(supplied.identity, supplied.payload) !== supplied.payloadDigest ||
+          observed && (observed.payloadDigest !== supplied.payloadDigest || canonicalJson(observed.identity) !== canonicalJson(supplied.identity))))
+        throw new ProtocolError(409, "Cancellation target conflict");
+      const original = observed ?? supplied;
       if (!original || original.identity.epoch !== body.epoch)
         throw new ProtocolError(409, "Unknown operation or epoch conflict");
       const grant = await this.authorize(original.identity, "cancel");
@@ -183,7 +188,7 @@ export class RemoteDaemon {
             epoch: Math.max(previous?.epoch ?? 0, body.epoch),
           });
         });
-      const receipt = await this.broker.cancel(target, body.epoch);
+      const receipt = await this.broker.cancel(target, body.epoch, supplied);
       return {
         ...receipt,
         operationId: body.operationId,

@@ -195,11 +195,14 @@ export class Outbox {
       if (!communicates(current.purpose, rules)) {
         await this.engine.store.put(tx, 'outbox', id, { ...current, status: 'dropped', error: 'Communication rule suppresses routine message', nextAttemptAt: 0 }); return;
       }
-      if (!source || source.listenedScopes !== undefined && !source.listenedScopes.includes(current.destination.threadRef) || !adapter.listened(current.destination)) {
+      if (!source || source.listenedScopes !== undefined && !source.listenedScopes.includes(current.destination.threadRef)) {
         await this.engine.store.put(tx, 'outbox', id, { ...current, status: 'dropped', error: 'Destination is no longer listened to', nextAttemptAt: 0 }); return;
       }
       if (!source.enabled || !adapter.enabled) {
         await this.engine.store.put(tx, 'outbox', id, { ...current, status: 'pending', error: 'Source is disabled', nextAttemptAt: this.clock.now() + 2000 }); return;
+      }
+      if (!adapter.listened(current.destination)) {
+        await this.engine.store.put(tx, 'outbox', id, { ...current, status: 'dropped', error: 'Destination is no longer listened to', nextAttemptAt: 0 }); return;
       }
       if (current.nextAttemptAt > this.clock.now()) return;
       if (current.attempt >= 8) { await this.engine.store.put(tx, 'outbox', id, { ...current, status: 'attention', error: 'Outbound message exhausted 8 attempts', nextAttemptAt: 0 }); return; }
