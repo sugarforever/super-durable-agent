@@ -42,6 +42,7 @@ export class PolicyController {
       for (const rule of policy.rules) {
         nonempty(rule.id, 'rule ID'); nonempty(rule.instructions, 'rule instructions');
         if (typeof rule.enabled !== 'boolean' || !Array.isArray(rule.capabilities) || ruleIds.has(rule.id)) throw new Error('Invalid or duplicate rule');
+        if (rule.communication !== undefined && (!rule.communication || typeof rule.communication !== 'object' || Array.isArray(rule.communication) || Object.entries(rule.communication).some(([key, value]) => !['acknowledgements', 'progress'].includes(key) || typeof value !== 'boolean'))) throw new Error('Invalid rule communication constraints');
         ruleIds.add(rule.id); for (const capability of rule.capabilities) nonempty(capability, 'capability');
       }
       await this.store.put(tx, 'policy', 'current', policy);
@@ -88,7 +89,7 @@ export class PolicyController {
   }
 
   /** Revalidate the existing grant; resumption never expands scope or creates a replacement Mandate. */
-  private async revalidateMandate(tx: Tx, mandate: Mandate, trigger: Trigger, policy: Policy): Promise<boolean> {
+  async revalidateMandate(tx: Tx, mandate: Mandate, trigger: Trigger, policy: Policy): Promise<boolean> {
     if (mandate.withdrawnAt !== null || mandate.sourceId !== trigger.sourceId) return false;
     const permitted = await this.permittedThreads(tx, trigger);
     const source = await this.store.get<Source>(tx, 'source', mandate.sourceId);
@@ -498,13 +499,23 @@ export class PolicyController {
     if (previous) {
       const frozen = await this.store.get(tx, 'deliveryRun', id);
       if (own && !previous.own && previous.status === 'pending' && !frozen) await this.store.put(tx, 'delivery', id, { ...previous, own: true, resume: ticket.lifecycle === 'open' });
-      if (own && !previous.own && (previous.status === 'delivered' || frozen)) {
+      if (own && !previous.own && (['delivered', 'retained'].includes(previous.status) || frozen)) {
         const ownershipId = this.id('delivery', ticket.id, triggerId, String(ticket.assignmentEpoch), 'ownership');
         if (!await this.store.get<DeliveryIntent>(tx, 'delivery', ownershipId)) await this.store.put(tx, 'delivery', ownershipId, { ...previous, id: ownershipId, ownershipOf: previous.id, own: true, resume: ticket.lifecycle === 'open', status: 'pending' });
       }
       return;
     }
-    await this.store.put(tx, 'delivery', id, { id, ticketId: ticket.id, triggerId, epoch: ticket.assignmentEpoch, own, resume: own && ticket.lifecycle === 'open', status: 'pending' } satisfies DeliveryIntent);
+    await this.store.put(tx, 'delivery', id, { id, ticketId: ticket.id, triggerId, epoch: ticket.assignmentEpoch, own, resume: own && ticket.lifecycle === 'open', status: !own && ticket.lifecycle === 'ended' ? 'retained' : 'pending' } satisfies DeliveryIntent);
+  }
+  /** Repair passive context left pending by older runtimes; retain access without waking an ended Worker. */
+  async retainPassiveContextInTransaction(tx: Tx): Promise<void> {
+    for (const delivery of await this.store.listInTransaction<DeliveryIntent>(tx, 'delivery')) {
+      if (delivery.status !== 'pending' || delivery.own || await this.store.get(tx, 'deliveryRun', delivery.id)) continue;
+      const ticket = await this.store.get<Ticket>(tx, 'ticket', delivery.ticketId);
+      if (!ticket || !(ticket.lifecycle === 'ended' || delivery.epoch < ticket.assignmentEpoch)) continue;
+      await this.store.put(tx, 'delivery', delivery.id, { ...delivery, status: 'retained' });
+      await this.releaseIntakeInTransaction(tx, delivery.triggerId);
+    }
   }
   /** Downstream receipt accounting: invalid/stale deliveries remain invalid and cannot resume work. */
   async acknowledgeDeliveryInTransaction(tx: Tx, deliveryId: string): Promise<void> {

@@ -404,6 +404,9 @@ export class AgentCoordinator {
   private async performPump(): Promise<void> {
     const { store } = this.engine;
     await reconcile(this.engine);
+    await this.engine.transaction(tx => this.engine.lifecycle.completeInTransaction(tx));
+    await this.engine.outbox?.reconcile();
+    await this.jobs.receipts.reconcile();
     await this.engine.transaction(async tx => {
       for (const intent of await store.listInTransaction<DeliveryIntent>(tx, "delivery")) {
         if (intent.status !== "pending" || await store.get(tx, "deliveryRun", intent.id)) continue;
@@ -1357,6 +1360,7 @@ export class AgentCoordinator {
         if (["attention", "blocked", "failed", "dropped"].includes(report.status))
           next.attention = `Worker reported ${report.status}`;
         await store.put(tx, "ticket", ticket.id, next);
+        await this.engine.outbox?.relayReport(tx, ticket, { ...value, ticketId: ticket.id }, receiptId);
         const assignment = await store.get<Assignment>(
           tx,
           "assignment",
@@ -1533,6 +1537,7 @@ export class AgentCoordinator {
         >("cancel")),
         ...(await this.engine.store.list<{ taskId?: TaskId<null> }>("redrive")),
         ...(await this.engine.store.list<{ taskId?: TaskId<null> }>("job")),
+        ...(await this.engine.store.list<{ taskId?: TaskId<null> }>("outbox")),
       ];
       for (const c of cancels)
         if (c.taskId) {
@@ -1553,6 +1558,7 @@ export class AgentCoordinator {
           ...(await this.engine.store.list<CancelIntent>("cancel")),
           ...(await this.engine.store.list<{ taskId?: TaskId<null>; status?: string }>("redrive")),
           ...(await this.engine.store.list<{ taskId?: TaskId<null>; status?: string }>("job")),
+          ...(await this.engine.store.list<{ taskId?: TaskId<null> }>("outbox")).map(({ taskId }) => ({ taskId, status: undefined })),
         ];
         let auxiliaryLive = false;
         for (const claim of auxiliary) {

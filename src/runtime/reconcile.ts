@@ -15,6 +15,7 @@ export async function nativeTasks(tx: Tx): Promise<TaskRecord<JsonValue, JsonVal
 export async function reconcile(engine: Engine): Promise<void> {
   await engine.transaction(async tx => {
     const { store, scheduler } = engine;
+    await engine.authorization.retainPassiveContextInTransaction(tx);
     const tasks = await nativeTasks(tx);
     const runs = await store.listInTransaction<AgentRun>(tx, 'deliveryRun');
     const redrives = await store.listInTransaction<RedriveClaim>(tx, 'redrive');

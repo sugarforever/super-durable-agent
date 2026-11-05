@@ -1,3 +1,5 @@
+import { TicketLifecycle } from './lifecycle.js';
+import type { Outbox } from '../services/outbox.js';
 import type { Context, JsonValue } from '@earendil-works/chord';
 import { defineTask, type Conversation, type Harness, type Tx } from '@earendil-works/pi-durable';
 import { Scheduler, type Clock } from '../runtime/scheduler.js';
@@ -32,7 +34,10 @@ export function createIntakeTask(store: DomainStore) {
 }
 export class Engine {
   readonly authorization = new PolicyController(this);
+  readonly lifecycle = new TicketLifecycle(this);
+  trackThread(ticketId: string, sourceId: string, threadRef: string, meta: CommandMeta) { return this.lifecycle.trackThread(ticketId, sourceId, threadRef, meta); }
   readonly scheduler: Scheduler;
+  outbox?: Outbox;
   /** Host preprocessing performs artifact IO before entering a transaction. */
   prepareEvent?: (event: NormalizedEvent) => Promise<PreparedEvent>;
 
@@ -78,7 +83,8 @@ export class Engine {
 
   async configureSource(source: Omit<Source, 'cursor'>): Promise<void> {
     if (!source.id?.trim() || !source.kind?.trim() || typeof source.enabled !== 'boolean' ||
-        (source.listenedScopes !== undefined && (!Array.isArray(source.listenedScopes) || source.listenedScopes.some((scope) => !scope?.trim())))) {
+        (source.listenedScopes !== undefined && (!Array.isArray(source.listenedScopes) || source.listenedScopes.some((scope) => !scope?.trim()))) ||
+        (source.repositoryAllowlist !== undefined && (!Array.isArray(source.repositoryAllowlist) || source.repositoryAllowlist.some(repository => typeof repository !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repository))))) {
       throw new Error('Invalid source configuration');
     }
     await this.transaction(async (tx) => {
@@ -86,6 +92,7 @@ export class Engine {
       await this.store.put(tx, 'source', source.id, {
         id: source.id, kind: source.kind, enabled: source.enabled,
         ...(source.listenedScopes === undefined ? {} : { listenedScopes: [...new Set(source.listenedScopes)] }),
+        ...(source.repositoryAllowlist === undefined ? {} : { repositoryAllowlist: [...new Set(source.repositoryAllowlist.map(repository => repository.toLowerCase()))] }),
         ...(existing?.cursor === undefined ? {} : { cursor: existing.cursor }),
       });
     });
@@ -108,7 +115,7 @@ export class Engine {
     }
   }
 
-  async receiveBatch(events: NormalizedEvent[], cursor: SourceCursor): Promise<ReceiveBatchResult> {
+  async receiveBatch(events: NormalizedEvent[], cursor: SourceCursor, after?: (tx: Tx, results: ReceiveResult[]) => Promise<void>, options: { preserveCursor?: boolean; filterDisabled?: boolean } = {}): Promise<ReceiveBatchResult> {
     if (!cursor?.sourceId?.trim() || events.some((event) => event.sourceId !== cursor.sourceId)) {
       throw new Error('Batch events and cursor must have the same source');
     }
@@ -120,10 +127,14 @@ export class Engine {
     try {
       return await this.transaction(async (tx) => {
         const source = await this.store.get<Source>(tx, 'source', cursor.sourceId);
-        if (!source?.enabled) throw new Error('Batch cursor source is not enabled');
+        if (!source?.enabled) {
+          if (options.filterDisabled) return { disposition: 'stored', results: normalized.map(() => ({ disposition: 'filtered', sourceId: cursor.sourceId })) };
+          throw new Error('Batch cursor source is not enabled');
+        }
         const results: ReceiveResult[] = [];
         for (const event of normalized) results.push(await this.receiveInTransaction(tx, event));
-        await this.store.put(tx, 'source', source.id, { ...source, cursor: cursor.value });
+        await after?.(tx, results);
+        if (!options.preserveCursor) await this.store.put(tx, 'source', source.id, { ...source, cursor: cursor.value });
         return { disposition: 'stored', results };
       });
     } catch (error) {

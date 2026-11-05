@@ -100,7 +100,7 @@ async function jobRuntime(cancellationHandler?: any, commandFor?: (fixture: any)
   }));
   r = await openSuperAgent({ directory, models, model, environment: { repository: f.repository, trustedLocalShell: true }, cancellationHandler });
   cleanups.push(async () => { await writeFile(join(f.root, 'finish'), 'done'); await r.agents?.waitForIdle(); await r.close(); });
-  return { ...f, r, ticket, faux, models, model, directory };
+  return { ...f, get r() { return r; }, ticket, faux, models, model, directory, async reopen(startPaused = false) { await r.close(); r = await openSuperAgent({ directory, startPaused, models, model, environment: { repository: f.repository, trustedLocalShell: true }, cancellationHandler }); } };
 }
 describe('native asynchronous Jobs', () => {
   it('starts from a real Worker tool, keeps capacity, accepts feedback, and delivers completion once', async () => {
@@ -257,18 +257,22 @@ describe('Job and broker authority fences', () => {
   it('never delivers a prior-epoch Job result note after explicit retry', async () => {
     const f = await jobRuntime();
     await until(async () => readFile(join(f.root, 'begun'), 'utf8').then(x => x === 'begun', () => false));
-    const oldKick = f.r.agents!.kick.bind(f.r.agents); f.r.agents!.kick = () => {};
+    // A no-op kick does not drain an already scheduled timer/pump. Close the
+    // coordinator before completing the Job so its real claim path is quiescent.
+    await f.r.agents!.close();
     await writeFile(join(f.root, 'finish'), 'done');
     await until(async () => (await f.r.list<any>('job'))[0]?.status === 'completed');
     const job = (await f.r.list<any>('job'))[0];
     expect((await f.r.list<any>('workerNote')).find(x => x.jobId === job.id)?.status).toBe('pending');
-    await f.r.stopTicket(f.ticket.id, alice, { commandId: 'stop-before-result' }); await f.r.agents!.waitForIdle();
+    await f.reopen(true);
+    expect((await f.r.list<any>('workerNote')).find(x => x.jobId === job.id)?.status).toBe('pending');
+    await f.r.stopTicket(f.ticket.id, alice, { commandId: 'stop-before-result' });
+    await f.r.activate(); await f.r.agents!.waitForIdle();
     await f.r.retryTicket(f.ticket.id, alice, { commandId: 'retry-before-result' });
     await f.r.agents!.pump(); await f.r.agents!.waitForIdle();
     expect((await f.r.list<any>('deliveryRun')).some(x => x.id === `job-result:${job.id}`)).toBe(false);
     const latest = await f.r.readTicket<any>(f.ticket.id);
     await expect(f.r.agents!.jobs.start(latest.workerConversationId, { assignmentId: f.ticket.assignmentId, epoch: 1, command: 'echo stale' }, 'stale-call')).rejects.toThrow(/Stale/);
-    f.r.agents!.kick = oldKick;
   });
 });
 
@@ -389,4 +393,45 @@ it('verifies legacy prepared descriptors against the canonical repository withou
   await expect(wrong.execute(f.request('legacy-wrong-read', { kind: 'read', path: 'source.txt' }))).rejects.toThrow(/repository/);
   expect(await readFile(descriptorPath, 'utf8')).toBe(canonicalJson(receipt));
   expect(await readFile(markerPath, 'utf8')).toBe(canonicalJson(receipt));
+});
+
+describe('Ticket workspace continuity',()=>{
+ it('preserves commits and dirty files across fresh Assignment authority and fences old leases',async()=>{
+   const f=await repo({trustedLocalShell:true});
+   await writeFile(join(f.prepared.cwd,'source.txt'),'committed work');
+   await run('git',['-C',f.prepared.cwd,'add','source.txt']);
+   await run('git',['-C',f.prepared.cwd,'commit','-m','worker change']);
+   const head=(await run('git',['-C',f.prepared.cwd,'rev-parse','HEAD'])).stdout.trim();
+   await writeFile(join(f.prepared.cwd,'dirty.txt'),'unsaved work');
+   const next={...identity,assignmentId:'resumed',epoch:2,mandateId:'fresh'};
+   f.configuration.authorize=async(i:any)=>({...i,capabilities:['repo.read','repo.write','command.execute']});
+   const payload={kind:'prepare' as const};
+   const prepared=await f.broker.prepare({operationId:'prepare-next',identity:next,payload,payloadDigest:operationDigest(next,payload)});
+   expect(prepared.cwd).toBe(f.prepared.cwd);
+   expect(prepared.environmentId).not.toBe(f.prepared.environmentId);
+   expect((await run('git',['-C',prepared.cwd,'rev-parse','HEAD'])).stdout.trim()).toBe(head);
+   expect(await readFile(join(prepared.cwd,'dirty.txt'),'utf8')).toBe('unsaved work');
+   await expect(f.broker.release(f.prepared.environmentId,'old-release')).rejects.toThrow();
+   await expect(f.broker.execute(f.request('old-write',{kind:'write',path:'dirty.txt',text:'bad'}))).rejects.toThrow();
+   expect(await f.broker.query('prepare')).toEqual(f.prepared);
+   const p={kind:'write' as const,environmentId:prepared.environmentId,path:'fresh.txt',text:'new authority'};
+   expect(await f.broker.execute({operationId:'fresh-write',identity:next,payload:p,payloadDigest:operationDigest(next,p)})).toMatchObject({status:'completed'});
+ });
+});
+
+it('preserves existing modes through atomic structured writes and edits without following symlinks', async () => {
+  const { chmod, stat } = await import('node:fs/promises');
+  const f = await repo();
+  for (const kind of ['write', 'edit'] as const) for (const mode of [0o755, 0o640]) {
+    const path = `${kind}-${mode}`; await writeFile(join(f.prepared.cwd, path), 'original'); await chmod(join(f.prepared.cwd, path), mode);
+    const action = kind === 'write' ? { kind, path, text: 'updated' } : { kind, path, oldText: 'original', newText: 'updated' };
+    expect(await f.broker.execute(f.request(path, action))).toMatchObject({ status: 'completed' });
+    expect((await stat(join(f.prepared.cwd, path))).mode & 0o777).toBe(mode);
+    expect(await readFile(join(f.prepared.cwd, path), 'utf8')).toBe('updated');
+  }
+  expect(await f.broker.execute(f.request('new-conservative', { kind: 'write', path: 'new-conservative', text: 'new' }))).toMatchObject({ status: 'completed' });
+  expect((await stat(join(f.prepared.cwd, 'new-conservative'))).mode & 0o777).toBe(0o600);
+  await symlink(join(f.prepared.cwd, 'source.txt'), join(f.prepared.cwd, 'linked'));
+  for (const kind of ['write', 'edit']) await expect(f.broker.execute(f.request(`linked-${kind}`, { kind, path: 'linked', text: 'unsafe', oldText: 'original', newText: 'unsafe' }))).rejects.toThrow(/symlink/);
+  expect(await readFile(join(f.prepared.cwd, 'source.txt'), 'utf8')).toBe('original');
 });

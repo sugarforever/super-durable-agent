@@ -4,9 +4,9 @@ The [checkpoint table](checkpoints.md) identifies which features exist in each P
 
 ## Open, inspect, and close
 
-`openSuperAgent({ directory, models?, model?, instanceId?, maxPending?, maxIndexEntries?, clock?, cancellationHandler?, environment?, preflight? })` acquires the local single-writer lock, opens SQLite, validates recovery metadata, and returns the runtime. Default bounds are 10,000 pending inputs and 10,000 entries per record-kind index. These are bounded first-release indexes, not unlimited historical retention.
+`openSuperAgent({ directory, models?, model?, instanceId?, maxPending?, maxIndexEntries?, clock?, cancellationHandler?, environment?, outbox?, startPaused?, preflight? })` acquires the local single-writer lock, opens SQLite, validates recovery metadata, and returns the runtime. Default bounds are 10,000 pending inputs and 10,000 entries per record-kind index. These are bounded first-release indexes, not unlimited historical retention.
 
-The runtime exposes `engine`, `harness`, `control`, `artifactRoot`, `receive`, `receiveBatch`, `readTicket`, `list`, and `close`. The domain facade also exposes Policy, decision, subscription, handback, stop, and end operations. Use `close()` in a finally block.
+The runtime exposes `engine`, `harness`, `control`, `artifactRoot`, `receive`, `receiveBatch`, `readTicket`, `list`, and `close`. The domain facade also exposes Policy, decision, subscription, handback, stop, and end operations. Use `close()` in a finally block. With startPaused, configure listeners and trusted bindings before calling activate(); activation is idempotent and retains model-free recovery restrictions.
 
 Without `model`, domain operations need no provider credentials. If existing agent work needs a provider, a model-free reopen leaves scheduling paused. This is an inspection/recovery mode, not a guarantee against a trusted host explicitly calling low-level Harness methods that enable progress.
 
@@ -54,7 +54,7 @@ const report = {
 await runtime.agents.report(workerConversationId, report);
 ```
 
-This checkpoint accepts only waiting, ready, and attention. The full progress/waiting/ready/blocked/failed/dropped and typed question lifecycle remains required in the following scheduler/Report checkpoint before Outbox or lifecycle consumers depend on it. This subset does not release Job reservations. Ready is a structured reviewable result, not automatic PR acceptance or Ticket completion. Plain final prose without a report requires attention and leaves input consumption outstanding.
+Reports accept progress, waiting, ready, blocked, failed, dropped, and attention, with typed questions and an explicit waitingFor reason. Questions normalize to waiting for human input. Job reservations remain governed by durable Job accounting. Ready is a structured reviewable result, not automatic PR acceptance or Ticket completion. Plain final prose without a report requires attention and leaves input consumption outstanding.
 
 ## Artifact recall
 
@@ -84,4 +84,24 @@ Worker tools start_job, get_job, stop_job, read_file, write_file, and edit_file 
 
 Broker prepare, execute, query, cancel, and release operations bind stable IDs to canonical payload digests and Ticket/Assignment/Mandate identity. Local preparation records an immutable base commit and uses a detached per-Ticket worktree. Repeated preparation preserves changes; unknown paths are never reset or overwritten. Structured operations reject traversal, repository metadata access, and symlink escapes. An unavailable requested sandbox is an error. These checks assume no hostile concurrent filesystem writer; they are not an OS sandbox.
 
+Admitted Jobs with running or uncertain outcomes receive durable query-only receipt checks. Each finite native Task queries the original operation once; persisted backoff grows from 2 seconds to a 60-second cap, with at most one live claim per Job and eight per runtime. Startup resumes unfinished claims and schedules due checks. Absence or query failure never authorizes another execution. An authoritative terminal receipt updates accounting and gives the current Worker a distinct deduplicated result after an earlier uncertainty notice; stopped or old-epoch results remain accounting-only. Only the matching resolved Job-only attention may clear.
+
 Shell Jobs require command.execute and explicit trustedLocalShell configuration. Output is bounded. If a process dies after command admission without a trustworthy completion receipt, recovery records unknown and quarantines its reservation; it does not execute the command again. Cancel confirms process termination where observable, without claiming external effects were undone.
+
+## Transactional Outbox
+
+Configure trusted sender adapters through `outbox: { adapters, random? }` when opening the runtime. Each SourceAdapter supplies sourceId, enabled, listened(destination), send(message, key), and queryReceipt(key). Receipt lookup returns found with a receipt, authoritative absent, or unknown. Provider credentials stay in adapter configuration.
+
+`runtime.outbox.enqueueMessage(tx, message)` participates in the caller's Engine transaction. Message authority includes ticketId, mandateId, assignmentEpoch, purpose, a sourceId/threadRef destination, payload, and idempotencyKey. A reused key binds all of these. Destinations must remain in the Mandate's source/scope, with channel.reply and current Policy authorization; no implicit administrator bypass exists.
+
+Structured ready Reports enqueue answers, questions enqueue questions, and blocked/failed/dropped/attention outcomes enqueue attention in the same transaction as consumption. Routine progress is quiet by default. Explicit rule communication flags can permit acknowledgements/progress; silence is rechecked before sending. Without an adapter, message intent remains visibly pending.
+
+Native sender Tasks are finite. Durable nextAttemptAt and attempt count survive restart; reconciliation dispatches due work, while a host timer only wakes it. Known no-send failures or authoritative absence can retry the same immutable key, with jittered backoff from 2 seconds to a 60-second cap and at most eight attempts. Generic network errors are uncertain until receipt lookup establishes otherwise. Stop fences queued sends; an already-started send may still complete and its receipt remains auditable.
+
+`runtime.outbox.inspectReceipt(id)` only queries and records a found receipt, including after stop. Absent/unknown never triggers another effect or fresh Ticket progress. A found receipt for the exact current open assignment can resolve its matching Outbox-only uncertain diagnostic and recheck natural completion after authenticated closure; stopped or old-epoch receipt repair remains accounting-only. Retain unresolved uncertain messages for inspection; do not replace their keys to force a retry.
+
+## Startup compatibility and migrations
+
+Trusted hosts may supply `extensions` and explicitly set `allowTaskMigrations: true` to install compatible durable Task upgrades. Startup scans all live Task definitions and versions before resuming scheduling. A version upgrade requires its registered native `TaskDefinition.migrate`; the pure migration is validated before pi performs the persisted migration at reservation. The callback may run more than once, so it must not perform external effects. Stable operation identities protect resumed execution, not callback invocation count.
+
+Document compatibility is a separate startup gate across session, conversation, and Task scopes. Unsupported Document kinds or versions fail closed. Task migration permission does not authorize a Document schema rewrite. Stop the service and take a verified backup before changing definitions.

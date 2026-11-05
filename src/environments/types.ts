@@ -1,6 +1,10 @@
 import { digest } from '../domain/model.js';
 export interface EndpointIdentity { ticketId: string; assignmentId: string; epoch: number; mandateId: string }
-export interface EndpointGrant extends EndpointIdentity { capabilities: string[] }
+export interface EndpointGrant extends EndpointIdentity {
+  capabilities: string[];
+  /** Trusted current controller cancellation authority only; never supplied by operation payloads. */
+  revokeEpoch?: true;
+}
 export type EndpointAction = 'prepare' | 'execute' | 'cancel' | 'release';
 /** Host/daemon authority lookup on every mutation. Never accept model-provided capability flags. */
 export type EndpointAuthorizer = (identity: EndpointIdentity, action: EndpointAction) => Promise<EndpointGrant>;
@@ -18,6 +22,8 @@ export interface PreparedReceipt extends ReceiptIdentity {
   status: 'prepared'; environmentId: string; cwd: string; baseCommit: string;
   /** Present on new receipts; legacy receipts are verified through their environment hash and real git state. */
   repository?: string; gitCommonDirectory?: string;
+  /** Physical worktree remains Ticket-specific while each epoch has its own lease. */
+  workspaceId?: string;
 }
 export type ExecutionResult = { text: string; truncated: boolean } | { bytes: number } |
   { stdout: string; stderr: string; truncated: boolean; exitCode: number | null; signal: string | null };
@@ -27,10 +33,17 @@ export type ExecutionReceipt = ReceiptIdentity & (
 export type LifecycleReceipt = ReceiptIdentity & { status: 'released' | 'cancelled' | 'unknown'; reason?: string };
 export type PreparationReceipt = PreparedReceipt | (Omit<PreparedReceipt, 'status'> & { status: 'unknown'; reason: string });
 export type BrokerReceipt = PreparationReceipt | ExecutionReceipt | LifecycleReceipt;
+/** Transport loss is not evidence that an endpoint effect did not occur. */
+export class UncertainEnvironmentError extends Error {
+  override readonly name = 'UncertainEnvironmentError';
+  constructor(readonly operationId: string, message = 'Endpoint outcome is uncertain; inspect the existing operation') { super(message); }
+}
 export interface EnvironmentBroker {
+  /** Trusted host binds the current controller authority before recovery effects resume. */
+  bindAuthority?(authorize: EndpointAuthorizer): void;
   prepare(request: PrepareRequest): Promise<PreparedReceipt>;
   execute(request: ExecuteRequest): Promise<ExecutionReceipt>;
   query(operationId: string): Promise<BrokerReceipt | undefined>;
-  cancel(operationId: string, epoch: number): Promise<ExecutionReceipt>;
+  cancel(operationId: string, epoch: number, target?: ExecuteRequest): Promise<ExecutionReceipt>;
   release(environmentId: string, operationId: string): Promise<LifecycleReceipt>;
 }
