@@ -1,4 +1,9 @@
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { SuperAgentRuntime } from "../runtime/open.js";
 import type {
@@ -7,6 +12,8 @@ import type {
   Policy,
   Ticket,
 } from "../domain/model.js";
+import { FeishuError, type FeishuSource } from "../sources/feishu.js";
+import type { RemoteEnvironmentBroker } from "../environments/remote.js";
 import { GitHubError, type GitHubSource } from "../sources/github.js";
 
 export interface ManagementPrincipal {
@@ -21,6 +28,10 @@ export interface ManagementOptions {
   token?: string;
   principals?: ManagementPrincipal[];
   github?: GitHubSource;
+  feishu?: FeishuSource;
+  remote?: RemoteEnvironmentBroker;
+  tls?: { key: string | Buffer; cert: string | Buffer };
+  allowInsecureLoopback?: boolean;
 }
 class HttpError extends Error {
   constructor(
@@ -103,6 +114,7 @@ export async function startManagementServer(
     options.port > 65535
   )
     throw new Error("Invalid management port");
+  await options.remote?.initialize();
   const hashes = principals.map((p) =>
     createHash("sha256").update(p.token).digest(),
   );
@@ -128,7 +140,18 @@ export async function startManagementServer(
       cancelPending: t.cancelPending,
       latestReport: t.latestReport,
     }));
-  const server = createServer(async (req, res) => {
+  if (
+    options.remote &&
+    !options.tls &&
+    !(
+      options.allowInsecureLoopback === true &&
+      ["127.0.0.1", "::1"].includes(options.host ?? "127.0.0.1")
+    )
+  )
+    throw new Error(
+      "Remote control listener requires TLS; insecure loopback is test-only",
+    );
+  const handler = async (req: IncomingMessage, res: ServerResponse) => {
     const send = (status: number, value: unknown) => {
       if (res.destroyed) return;
       res.statusCode = status;
@@ -139,6 +162,29 @@ export async function startManagementServer(
     };
     try {
       const path = new URL(req.url ?? "/", "http://localhost").pathname;
+      if (options.remote && (await options.remote.handleControl(req, res)))
+        return;
+      if (path === "/webhooks/feishu") {
+        if (req.method !== "POST")
+          throw new HttpError(405, "Method not allowed");
+        if (!options.feishu)
+          throw new HttpError(404, "Feishu source not configured");
+        const raw = await readBody(req);
+        const headers = Object.fromEntries(
+          Object.entries(req.headers).map(([k, v]) => [
+            k,
+            typeof v === "string" ? v : undefined,
+          ]),
+        );
+        const result = await options.feishu.webhook(runtime, raw, headers);
+        send(
+          "disposition" in result && result.disposition === "backpressure"
+            ? 503
+            : 200,
+          result,
+        );
+        return;
+      }
       if (path === "/webhooks/github") {
         if (req.method !== "POST")
           throw new HttpError(405, "Method not allowed");
@@ -194,11 +240,15 @@ export async function startManagementServer(
               status: t.record.state.status,
             })),
             tickets: await safeTickets(),
+            endpoints: options.remote ? [options.remote.diagnostics()] : [],
             jobs: (await runtime.list<any>("job")).map((j) => ({
               id: j.id,
               ticketId: j.ticketId,
               epoch: j.epoch,
               status: j.status,
+              commandDigest: j.commandDigest,
+              environmentId: j.environmentId,
+              receiptStatus: j.receipt?.status,
             })),
           };
         } else if (ticketMatch) {
@@ -210,7 +260,9 @@ export async function startManagementServer(
           value = {
             ok: true,
             tickets: (await safeTickets()).length,
-            environmentConfigured: !!runtime.agents?.jobs.broker,
+            environmentConfigured:
+              !!options.remote || !!runtime.agents?.jobs.broker,
+            endpoints: options.remote ? [options.remote.diagnostics()] : [],
             pendingIntake: (await runtime.list<any>("intake")).filter(
               (i) => !i.released,
             ).length,
@@ -299,7 +351,11 @@ export async function startManagementServer(
       }
       send((result as any)?.disposition === "backpressure" ? 503 : 200, result);
     } catch (error) {
-      if (error instanceof HttpError || error instanceof GitHubError)
+      if (
+        error instanceof HttpError ||
+        error instanceof GitHubError ||
+        error instanceof FeishuError
+      )
         send(error.status, { error: error.message });
       else
         send(400, {
@@ -307,7 +363,10 @@ export async function startManagementServer(
           detail: error instanceof Error ? error.message : "Invalid request",
         });
     }
-  });
+  };
+  const server = options.tls
+    ? createHttpsServer(options.tls, handler)
+    : createServer(handler);
   server.requestTimeout = 15000;
   server.headersTimeout = 10000;
   await new Promise<void>((resolve, reject) => {
@@ -322,7 +381,7 @@ export async function startManagementServer(
     throw new Error("Invalid server address");
   let closing: Promise<void> | undefined;
   return {
-    address: `http://${address.family === "IPv6" ? `[${address.address}]` : address.address}:${address.port}`,
+    address: `${options.tls ? "https" : "http"}://${address.family === "IPv6" ? `[${address.address}]` : address.address}:${address.port}`,
     close: () =>
       (closing ??= new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));

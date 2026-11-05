@@ -406,6 +406,7 @@ export class AgentCoordinator {
     await reconcile(this.engine);
     await this.engine.transaction(tx => this.engine.lifecycle.completeInTransaction(tx));
     await this.engine.outbox?.reconcile();
+    await this.jobs.receipts.reconcile();
     await this.engine.transaction(async tx => {
       for (const intent of await store.listInTransaction<DeliveryIntent>(tx, "delivery")) {
         if (intent.status !== "pending" || await store.get(tx, "deliveryRun", intent.id)) continue;

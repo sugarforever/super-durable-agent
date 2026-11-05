@@ -15,6 +15,12 @@ import type {
   Ticket,
 } from "./domain/model.js";
 import { startManagementServer, redact } from "./api/server.js";
+import {
+  configuredPrincipals,
+  configuredRemote,
+  configuredFeishu,
+  configObject,
+} from "./runtime/adapter-config.js";
 import { GitHubSource } from "./sources/github.js";
 
 const help = `Super Durable Agent
@@ -30,11 +36,15 @@ Commands:
   policy set           Apply policy JSON from standard input as local operator.
   serve / run          Start authenticated HTTP service; run requires a model.
   demo                 Run deterministic native Router/Worker/feedback demo.
+  backup <NEW_PATH>    Offline backup under the primary writer lock.
+  restore <BACKUP>     Restore into a NEW --directory; external paths stay original.
+  watch                Independent supervisor; --config uses watchdog JSON.
 
 Options:
   --directory PATH / --data-dir PATH (or SUPER_AGENT_DIRECTORY)
   --config PATH        JSON config containing options, credential references,
-                       and optional local environment settings.
+                       local or remoteEnvironmentBroker settings, and feishu.
+                       Remote daemon: node dist/daemon/cli.js --config PATH.
   --provider NAME      openai or anthropic (registers only the selected provider).
   --model MODEL_ID     Explicit model ID from the selected provider.
   --model-key-env NAME Optional provider API key environment reference.
@@ -59,11 +69,15 @@ interface Config {
   host?: string;
   port?: number;
   tokenEnv?: string;
+  managementPrincipals?: unknown;
   githubRepositories?: string[];
   githubSecretEnv?: string;
   githubTokenEnv?: string;
   githubOwnLogins?: string[];
   listenedScopes?: string[];
+  remoteEnvironmentBroker?: unknown;
+  feishu?: unknown;
+  managementTls?: { keyFile: string; certFile: string };
   environment?: {
     repository: string;
     directory?: string;
@@ -78,12 +92,16 @@ const allowedConfig = new Set([
   "host",
   "port",
   "tokenEnv",
+  "managementPrincipals",
   "githubRepositories",
   "githubSecretEnv",
   "githubTokenEnv",
   "githubOwnLogins",
   "listenedScopes",
   "environment",
+  "remoteEnvironmentBroker",
+  "feishu",
+  "managementTls",
 ]);
 function localEnvironment(input: unknown): OpenOptions["environment"] {
   if (input === undefined) return undefined;
@@ -191,9 +209,8 @@ async function initialize(runtime: SuperAgentRuntime) {
     );
 }
 async function demo(directory: string) {
-  const { fauxProvider, fauxAssistantMessage, fauxToolCall } = await import(
-    "@earendil-works/pi-ai/providers/faux"
-  );
+  const { fauxProvider, fauxAssistantMessage, fauxToolCall } =
+    await import("@earendil-works/pi-ai/providers/faux");
   const faux = fauxProvider(),
     models = createModels();
   models.setProvider(faux.provider);
@@ -327,6 +344,7 @@ async function demo(directory: string) {
   }
 }
 export async function main(args = process.argv.slice(2)): Promise<void> {
+  if(args[0]==="watch") {await (await import("./watchdog/cli.js")).watchdogMain(args.slice(1));return;}
   const positional: string[] = [];
   let config: Config = {
     directory: process.env.SUPER_AGENT_DIRECTORY ?? ".super-durable-agent",
@@ -397,7 +415,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   const expected = ["init", "receive", "serve", "run", "demo"].includes(command)
     ? 1
-    : command === "list" || command === "policy"
+    : command === "list" || command === "policy" || command === "backup" || command === "restore"
       ? 2
       : command === "show"
         ? 3
@@ -409,6 +427,12 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     throw new Error("Use policy get or policy set");
   if (typeof config.directory !== "string" || !config.directory.trim())
     throw new Error("Directory required");
+  if (command === "backup" || command === "restore") {
+    const {backupRuntime,restoreRuntime}=await import('./runtime/backup.js');
+    const manifest=command==='backup'?await backupRuntime(config.directory,kind):await restoreRuntime(kind,config.directory);
+    process.stdout.write(JSON.stringify({directory:resolve(command==='backup'?kind:config.directory),instanceId:manifest.metadata.instanceId,inspectionOnly:manifest.inspectionOnly,externalDependencies:manifest.external.length})+'\n');
+    return;
+  }
   if (command === "demo") {
     process.stdout.write(
       JSON.stringify(await demo(config.directory), null, 2) + "\n",
@@ -440,10 +464,29 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   const environment = service
     ? localEnvironment(config.environment)
     : undefined;
+  const remote = service
+    ? configuredRemote(config.remoteEnvironmentBroker, config.directory)
+    : undefined;
+  if (remote && environment)
+    throw new Error("Choose one local or remote environment");
+  const feishu = service ? configuredFeishu(config.feishu) : undefined;
+  let managementTls;
+  if (service && config.managementTls) {
+    const tls = configObject(
+      config.managementTls,
+      ["keyFile", "certFile"],
+      "management TLS",
+    );
+    managementTls = {
+      key: await readFile(tls.keyFile),
+      cert: await readFile(tls.certFile),
+    };
+  }
   const modelOptions = service ? await configuredModels(config) : {};
   if (command === "run" && !modelOptions.model)
     throw new Error("run requires --provider and --model");
-  const token = service
+  const principals = service ? configuredPrincipals(config.managementPrincipals) : undefined;
+  const token = service && (config.tokenEnv || !principals)
     ? secret(config.tokenEnv ?? "SUPER_AGENT_TOKEN", true)
     : undefined;
   const github =
@@ -468,7 +511,17 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     directory: config.directory,
     ...modelOptions,
     ...(environment ? { environment } : {}),
-    ...(github ? { outbox: { adapters: [github] } } : {}),
+    ...(remote ? { environment: { broker: remote } } : {}),
+    ...(service ? { startPaused: true } : {}),
+    ...(github || feishu
+      ? {
+          outbox: {
+            adapters: [github, feishu].filter(
+              (source): source is NonNullable<typeof source> => !!source,
+            ),
+          },
+        }
+      : {}),
   });
   try {
     let result: unknown;
@@ -510,21 +563,28 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       case "run": {
         await initialize(runtime);
         await github?.configure(runtime);
+        await feishu?.configure(runtime);
         const server = await startManagementServer(runtime, {
           host: config.host,
           port: config.port ?? 8787,
           token,
+          principals,
           github,
+          feishu,
+          remote,
+          tls: managementTls,
+          allowInsecureLoopback: remote?.options.allowInsecureLoopback,
         });
-        process.stdout.write(
-          JSON.stringify({
-            listening: server.address,
-            model: modelOptions.model ?? null,
-            tokenRef: `env:${config.tokenEnv ?? "SUPER_AGENT_TOKEN"}`,
-            source: github?.sourceId ?? null,
-          }) + "\n",
-        );
         try {
+          await runtime.activate();
+          process.stdout.write(
+            JSON.stringify({
+              listening: server.address,
+              model: modelOptions.model ?? null,
+              tokenRef: `env:${config.tokenEnv ?? "SUPER_AGENT_TOKEN"}`,
+              source: github?.sourceId ?? null,
+            }) + "\n",
+          );
           await new Promise<void>((resolve) => {
             const shutdown = () => {
               process.off("SIGINT", shutdown);
@@ -536,6 +596,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
           });
         } finally {
           github?.close();
+          feishu?.close();
           await server.close();
         }
         return;
@@ -544,6 +605,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     process.stdout.write(JSON.stringify(redact(result), null, 2) + "\n");
   } finally {
     github?.close();
+    feishu?.close();
     await runtime.close();
   }
 }

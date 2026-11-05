@@ -499,13 +499,23 @@ export class PolicyController {
     if (previous) {
       const frozen = await this.store.get(tx, 'deliveryRun', id);
       if (own && !previous.own && previous.status === 'pending' && !frozen) await this.store.put(tx, 'delivery', id, { ...previous, own: true, resume: ticket.lifecycle === 'open' });
-      if (own && !previous.own && (previous.status === 'delivered' || frozen)) {
+      if (own && !previous.own && (['delivered', 'retained'].includes(previous.status) || frozen)) {
         const ownershipId = this.id('delivery', ticket.id, triggerId, String(ticket.assignmentEpoch), 'ownership');
         if (!await this.store.get<DeliveryIntent>(tx, 'delivery', ownershipId)) await this.store.put(tx, 'delivery', ownershipId, { ...previous, id: ownershipId, ownershipOf: previous.id, own: true, resume: ticket.lifecycle === 'open', status: 'pending' });
       }
       return;
     }
-    await this.store.put(tx, 'delivery', id, { id, ticketId: ticket.id, triggerId, epoch: ticket.assignmentEpoch, own, resume: own && ticket.lifecycle === 'open', status: 'pending' } satisfies DeliveryIntent);
+    await this.store.put(tx, 'delivery', id, { id, ticketId: ticket.id, triggerId, epoch: ticket.assignmentEpoch, own, resume: own && ticket.lifecycle === 'open', status: !own && ticket.lifecycle === 'ended' ? 'retained' : 'pending' } satisfies DeliveryIntent);
+  }
+  /** Repair passive context left pending by older runtimes; retain access without waking an ended Worker. */
+  async retainPassiveContextInTransaction(tx: Tx): Promise<void> {
+    for (const delivery of await this.store.listInTransaction<DeliveryIntent>(tx, 'delivery')) {
+      if (delivery.status !== 'pending' || delivery.own || await this.store.get(tx, 'deliveryRun', delivery.id)) continue;
+      const ticket = await this.store.get<Ticket>(tx, 'ticket', delivery.ticketId);
+      if (!ticket || !(ticket.lifecycle === 'ended' || delivery.epoch < ticket.assignmentEpoch)) continue;
+      await this.store.put(tx, 'delivery', delivery.id, { ...delivery, status: 'retained' });
+      await this.releaseIntakeInTransaction(tx, delivery.triggerId);
+    }
   }
   /** Downstream receipt accounting: invalid/stale deliveries remain invalid and cannot resume work. */
   async acknowledgeDeliveryInTransaction(tx: Tx, deliveryId: string): Promise<void> {
