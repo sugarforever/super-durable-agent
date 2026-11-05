@@ -1,7 +1,7 @@
 import type { JsonValue } from '@earendil-works/chord';
 import type { Tx } from '@earendil-works/pi-durable';
 import type { Engine } from './engine.js';
-import { canonicalJson, scopedId, type Actor, type Assignment, type CancelIntent, type CommandMeta, type Decision,
+import { canonicalJson, scopedId, digest, type Actor, type Assignment, type CancelIntent, type CommandMeta, type Decision,
   type DecisionOutcome, type DeliveryIntent, type Disposition, type Eval, type IntakeIntent, type Mandate,
   type Policy, type Source, type Subscription, type Ticket, type Trigger } from './model.js';
 
@@ -11,7 +11,7 @@ const defaultExplicitCapabilities = ['repo.read', 'channel.reply'];
 const defaultPolicy = (): Policy => ({ version: 0, acceptMode: 'observe', allowedActors: [], botActors: [], rules: [] });
 const payload = (value: unknown): JsonValue => JSON.parse(canonicalJson(value)) as JsonValue;
 function nonempty(value: string, name: string) { if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} must be nonempty`); }
-function human(actor: Actor) { return actor.kind === 'human' && actor.trusted; }
+function human(actor: Actor) { return !!actor && typeof actor.id === 'string' && !!actor.id.trim() && actor.kind === 'human' && actor.trusted === true; }
 function allowedHuman(policy: Policy, actor: Actor) { return human(actor) && policy.allowedActors.includes(actor.id); }
 function basis(policy: Policy, trigger: Trigger): Eval['basis'] | undefined {
   if (allowedHuman(policy, trigger.actor)) return trigger.addressed ? 'explicit' : 'inferred';
@@ -42,6 +42,7 @@ export class PolicyController {
       for (const rule of policy.rules) {
         nonempty(rule.id, 'rule ID'); nonempty(rule.instructions, 'rule instructions');
         if (typeof rule.enabled !== 'boolean' || !Array.isArray(rule.capabilities) || ruleIds.has(rule.id)) throw new Error('Invalid or duplicate rule');
+        if (rule.communication !== undefined && (!rule.communication || typeof rule.communication !== 'object' || Array.isArray(rule.communication) || Object.entries(rule.communication).some(([key, value]) => !['acknowledgements', 'progress'].includes(key) || typeof value !== 'boolean'))) throw new Error('Invalid rule communication constraints');
         ruleIds.add(rule.id); for (const capability of rule.capabilities) nonempty(capability, 'capability');
       }
       await this.store.put(tx, 'policy', 'current', policy);
@@ -88,7 +89,7 @@ export class PolicyController {
   }
 
   /** Revalidate the existing grant; resumption never expands scope or creates a replacement Mandate. */
-  private async revalidateMandate(tx: Tx, mandate: Mandate, trigger: Trigger, policy: Policy): Promise<boolean> {
+  async revalidateMandate(tx: Tx, mandate: Mandate, trigger: Trigger, policy: Policy): Promise<boolean> {
     if (mandate.withdrawnAt !== null || mandate.sourceId !== trigger.sourceId) return false;
     const permitted = await this.permittedThreads(tx, trigger);
     const source = await this.store.get<Source>(tx, 'source', mandate.sourceId);
@@ -390,21 +391,90 @@ export class PolicyController {
     }
     const mandate = (await this.store.get<Mandate>(tx, 'mandate', ticket.mandateId))!;
     await this.store.put(tx, 'mandate', mandate.id, { ...mandate, withdrawnAt: Date.now() });
-    await this.store.put(tx, 'ticket', ticketId, { ...ticket, lifecycle: 'stopped', revision: ticket.revision + 1, assignmentEpoch: ticket.assignmentEpoch + 1 });
+    await this.store.put(tx, 'ticket', ticketId, { ...ticket, lifecycle: 'stopped', revision: ticket.revision + 1, assignmentEpoch: ticket.assignmentEpoch + 1, cancelPending: true });
     const assignment = await this.store.get<Assignment>(tx, 'assignment', ticket.assignmentId);
     if (assignment) await this.store.put(tx, 'assignment', assignment.id, { ...assignment, status: 'stopped' });
     const id = this.id('cancel', ticketId, String(ticket.assignmentEpoch));
-    await this.store.put(tx, 'cancel', id, { id, ticketId, assignmentId: ticket.assignmentId, epoch: ticket.assignmentEpoch, status: 'pending', reason } satisfies CancelIntent);
+    const cancelPayload = { ticketId, assignmentId: ticket.assignmentId, epoch: ticket.assignmentEpoch, reason };
+    await this.store.put(tx, 'cancel', id, { id, ...cancelPayload, status: 'pending', cancelKey: id, payloadDigest: digest(cancelPayload) } satisfies CancelIntent);
     await this.releaseTerminatedOwnership(tx, ticketId, reason, excludedTriggerIds);
-    for (const kind of ['delivery', 'outbox']) {
+    for (const kind of ['delivery', 'deliveryRun', 'outbox']) {
       for (const record of await this.store.listInTransaction<{ id: string; ticketId?: string; triggerId?: string; status: string }>(tx, kind)) {
-        if (record.ticketId !== ticketId || record.status !== 'pending') continue;
+        if (record.ticketId !== ticketId || !['pending', 'submitted', 'queued', 'retrying'].includes(record.status)) continue;
         await this.store.put(tx, kind, record.id, { ...record, status: 'invalid' });
         if (record.triggerId) await this.releaseIntakeInTransaction(tx, record.triggerId);
       }
     }
     for (const triggerId of excludedTriggerIds) await this.releaseIntakeInTransaction(tx, triggerId);
     await this.drainQueuesInTransaction(tx);
+  }
+  async retryTicket(ticketId: string, actor: Actor, meta: CommandMeta): Promise<void> {
+    await this.engine.command(meta.commandId, payload({ operation: 'retryTicket', ticketId, actor, meta }), async tx => {
+      const policy = await this.policyInTransaction(tx);
+      if (!allowedHuman(policy, actor) && !(human(actor) && actor.id === 'operator')) throw new Error('Retry requires an authorized trusted human');
+      const ticket = await this.store.get<Ticket>(tx, 'ticket', ticketId);
+      if (!ticket) throw new Error('Unknown Ticket');
+      if (meta.expectedRevision !== undefined && meta.expectedRevision !== ticket.revision) throw new Error('Ticket revision conflict');
+      const oldMandate = (await this.store.get<Mandate>(tx, 'mandate', ticket.mandateId))!;
+      const mandate = { ...oldMandate, withdrawnAt: null };
+      const trigger: Trigger = { id: 'retry', sourceId: mandate.sourceId, threads: mandate.scope, actor: mandate.actor, externalId: 'retry', revision: '1', body: '', addressed: true, occurredAt: Date.now(), receivedAt: Date.now(), ordinal: 0, digest: '' };
+      if (!await this.revalidateMandate(tx, mandate, trigger, policy)) throw new Error('Retry Mandate no longer authorized');
+      if (ticket.lifecycle !== 'stopped') {
+        const cancelId = this.id('cancel', ticketId, String(ticket.assignmentEpoch));
+        const cancellation = { ticketId, assignmentId: ticket.assignmentId, epoch: ticket.assignmentEpoch, reason: 'Superseded by authenticated retry' };
+        if (!await this.store.get(tx, 'cancel', cancelId)) await this.store.put(tx, 'cancel', cancelId, { id: cancelId, ...cancellation, status: 'pending', cancelKey: cancelId, payloadDigest: digest(cancellation) } satisfies CancelIntent);
+        await this.store.put(tx, 'mandate', oldMandate.id, { ...oldMandate, withdrawnAt: Date.now() });
+        for (const run of await this.store.listInTransaction<{ id: string; ticketId?: string; epoch?: number; status: string }>(tx, 'deliveryRun'))
+          if (run.ticketId === ticketId && run.epoch === ticket.assignmentEpoch && ['pending','submitted'].includes(run.status)) await this.store.put(tx, 'deliveryRun', run.id, { ...run, status: 'invalid' });
+        for (const delivery of await this.store.listInTransaction<DeliveryIntent>(tx, 'delivery'))
+          if (delivery.ticketId === ticketId && delivery.epoch === ticket.assignmentEpoch && delivery.status === 'pending') await this.store.put(tx, 'delivery', delivery.id, { ...delivery, status: 'invalid' });
+      }
+      const epoch = ticket.assignmentEpoch + 1, assignmentId = this.id('assignment', ticketId, String(epoch));
+      const mandateId = this.id('mandate', ticketId, 'retry', String(epoch));
+      await this.store.put(tx, 'mandate', mandateId, { ...mandate, id: mandateId });
+      const next: Ticket = { ...ticket, lifecycle: 'open', assignmentEpoch: epoch, assignmentId, mandateId, revision: ticket.revision + 1, cancelPending: true };
+      delete next.attention; delete next.latestReport;
+      await this.store.put(tx, 'ticket', ticketId, next);
+      await this.store.put(tx, 'assignment', assignmentId, { id: assignmentId, ticketId, epoch, status: 'pending' } satisfies Assignment);
+      const previous = await this.store.get<Assignment>(tx, 'assignment', ticket.assignmentId);
+      if (previous) await this.store.put(tx, 'assignment', previous.id, { ...previous, status: 'ended' });
+      const inputs = await this.store.listInTransaction<DeliveryIntent>(tx, 'delivery');
+      const consumed = await this.store.listInTransaction<{ id: string; consumed: boolean }>(tx, 'deliveryRun');
+      const pending = new Map<string, DeliveryIntent>();
+      for (const input of inputs) {
+        if (input.ticketId !== ticketId || consumed.some(run => run.id === input.id && run.consumed)) continue;
+        const disposition = await this.store.get<Disposition>(tx, 'disposition', input.triggerId);
+        if (input.own && disposition?.consumedTicketIds?.includes(ticketId)) continue;
+        const previous = pending.get(input.triggerId);
+        if (!previous || input.own) pending.set(input.triggerId, input);
+      }
+      const seen = new Set<string>();
+      for (const input of pending.values()) {
+        const disposition = await this.store.get<Disposition>(tx, 'disposition', input.triggerId);
+        seen.add(input.triggerId);
+        if (input.own && disposition) await this.store.put(tx, 'disposition', input.triggerId, { ...disposition, ownerTickets: [...new Set([...disposition.ownerTickets, ticketId])], handbacks: disposition.handbacks.filter(x => x.ticketId !== ticketId), acknowledged: false });
+        await this.deliverInTransaction(tx, next, input.triggerId, input.own);
+      }
+      let requeuedNotes = 0;
+      const notes = await this.store.listInTransaction<{ id: string; ticketId: string; status: string; retryOf?: string; text: string }>(tx, 'workerNote');
+      const noteGroups = new Map<string, typeof notes>();
+      for (const note of notes.filter(note => note.ticketId === ticketId)) {
+        const logicalId = note.retryOf ?? note.id;
+        noteGroups.set(logicalId, [...(noteGroups.get(logicalId) ?? []), note]);
+      }
+      for (const [logicalId, group] of noteGroups) {
+        if (group.some(note => note.status === 'pending') || group.some(note => consumed.some(run => run.id === note.id && run.consumed))) continue;
+        const prior = group.at(-1)!;
+        if (!consumed.some(run => run.id === prior.id)) continue;
+        const id = this.id('retryNote', ticketId, logicalId, String(epoch));
+        await this.store.put(tx, 'workerNote', id, { ...prior, id, retryOf: logicalId, status: 'pending', human: true });
+        requeuedNotes++;
+      }
+      if (!seen.size && !requeuedNotes) {
+        const id = this.id('retryNote', ticketId, String(epoch));
+        await this.store.put(tx, 'workerNote', id, { id, ticketId, status: 'pending', human: true, text: 'Authenticated explicit retry. Continue the existing Ticket goal under the new assignment.' });
+      }
+    });
   }
   async endTicket(ticketId: string, epoch: number, meta: CommandMeta): Promise<void> {
     await this.engine.command(meta.commandId, payload({ operation: 'endTicket', ticketId, epoch, meta }), async tx => {
@@ -429,13 +499,23 @@ export class PolicyController {
     if (previous) {
       const frozen = await this.store.get(tx, 'deliveryRun', id);
       if (own && !previous.own && previous.status === 'pending' && !frozen) await this.store.put(tx, 'delivery', id, { ...previous, own: true, resume: ticket.lifecycle === 'open' });
-      if (own && !previous.own && (previous.status === 'delivered' || frozen)) {
+      if (own && !previous.own && (['delivered', 'retained'].includes(previous.status) || frozen)) {
         const ownershipId = this.id('delivery', ticket.id, triggerId, String(ticket.assignmentEpoch), 'ownership');
         if (!await this.store.get<DeliveryIntent>(tx, 'delivery', ownershipId)) await this.store.put(tx, 'delivery', ownershipId, { ...previous, id: ownershipId, ownershipOf: previous.id, own: true, resume: ticket.lifecycle === 'open', status: 'pending' });
       }
       return;
     }
-    await this.store.put(tx, 'delivery', id, { id, ticketId: ticket.id, triggerId, epoch: ticket.assignmentEpoch, own, resume: own && ticket.lifecycle === 'open', status: 'pending' } satisfies DeliveryIntent);
+    await this.store.put(tx, 'delivery', id, { id, ticketId: ticket.id, triggerId, epoch: ticket.assignmentEpoch, own, resume: own && ticket.lifecycle === 'open', status: !own && ticket.lifecycle === 'ended' ? 'retained' : 'pending' } satisfies DeliveryIntent);
+  }
+  /** Repair passive context left pending by older runtimes; retain access without waking an ended Worker. */
+  async retainPassiveContextInTransaction(tx: Tx): Promise<void> {
+    for (const delivery of await this.store.listInTransaction<DeliveryIntent>(tx, 'delivery')) {
+      if (delivery.status !== 'pending' || delivery.own || await this.store.get(tx, 'deliveryRun', delivery.id)) continue;
+      const ticket = await this.store.get<Ticket>(tx, 'ticket', delivery.ticketId);
+      if (!ticket || !(ticket.lifecycle === 'ended' || delivery.epoch < ticket.assignmentEpoch)) continue;
+      await this.store.put(tx, 'delivery', delivery.id, { ...delivery, status: 'retained' });
+      await this.releaseIntakeInTransaction(tx, delivery.triggerId);
+    }
   }
   /** Downstream receipt accounting: invalid/stale deliveries remain invalid and cannot resume work. */
   async acknowledgeDeliveryInTransaction(tx: Tx, deliveryId: string): Promise<void> {

@@ -21,6 +21,8 @@ export interface Source {
   kind: string;
   enabled: boolean;
   listenedScopes?: string[];
+  /** Host-configured repository boundary for GitHub thread binding. */
+  repositoryAllowlist?: string[];
   cursor?: JsonValue;
 }
 export interface PreparedEvent extends NormalizedEvent { bodyArtifact?: string; /** Host-only digest of the original normalized payload before spill. */ originalDigest?: string }
@@ -93,7 +95,7 @@ export function normalizeEvent(event: NormalizedEvent): NormalizedEvent {
   };
 }
 
-export interface Rule { id: ID; enabled: boolean; instructions: string; capabilities: string[] }
+export interface Rule { id: ID; enabled: boolean; instructions: string; capabilities: string[]; communication?: { acknowledgements?: boolean; progress?: boolean } }
 export interface Policy {
   version: number;
   acceptMode: 'off' | 'observe' | 'auto';
@@ -111,9 +113,9 @@ export interface Mandate {
 export interface Ticket {
   id: ID; goal: string; mandateId: ID; lifecycle: 'open' | 'ended' | 'stopped'; revision: number;
   assignmentId: ID; assignmentEpoch: number; goalArtifact?: string; workerConversationId?: import('@earendil-works/pi-durable').ConversationId;
-  latestReport?: JsonValue; attention?: string;
+  latestReport?: JsonValue; attention?: string; cancelPending?: boolean;
 }
-export interface Assignment { id: ID; ticketId: ID; epoch: number; status: 'pending' | 'running' | 'ended' | 'stopped' }
+export interface Assignment { id: ID; ticketId: ID; epoch: number; status: 'pending' | 'running' | 'ended' | 'stopped'; capacityClass?: 'ordinary' | 'human' }
 export interface Eval {
   id: ID; threadId: ID; threadIds?: ID[]; triggerIds: ID[]; policyVersion: number; epoch: number;
   status: 'pending' | 'decided' | 'invalid'; basis: 'explicit' | 'inferred';
@@ -133,7 +135,12 @@ export type DecisionOutcome =
 export interface Decision { id: ID; evalId: ID; epoch: number; policyVersion: number; outcome: DecisionOutcome }
 export interface DeliveryIntent {
   id: ID; ticketId: ID; triggerId: ID; epoch: number; own: boolean; resume: boolean;
-  status: 'pending' | 'delivered' | 'invalid'; ownershipOf?: ID; mode?: 'followUp' | 'steer';
+  status: 'pending' | 'delivered' | 'retained' | 'invalid'; ownershipOf?: ID; mode?: 'followUp' | 'steer';
 }
-export interface CancelIntent { id: ID; ticketId: ID; assignmentId: ID; epoch: number; status: 'pending' | 'completed' | 'attention'; reason: string }
-export interface Report { ticketId: ID; assignmentId: ID; epoch: number; content: JsonValue }
+export interface CancelIntent { id: ID; ticketId: ID; assignmentId: ID; epoch: number; status: 'pending' | 'completed' | 'attention'; reason: string; cancelKey?: string; payloadDigest?: string; nativeConfirmed?: boolean; endpointConfirmed?: boolean; taskId?: TaskId<null>; attempts?: number }
+export type ReportStatus = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped' | 'attention';
+export interface WorkerQuestion { id: ID; text: string; options?: string[] }
+export interface Report {
+  ticketId: ID; assignmentId: ID; epoch: number; reportId: ID; inputIds: ID[];
+  status: ReportStatus; questions?: WorkerQuestion[]; waitingFor?: 'human' | 'endpoint' | 'input'; content: JsonValue;
+}
