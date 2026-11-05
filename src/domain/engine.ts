@@ -1,10 +1,13 @@
+import { TicketLifecycle } from './lifecycle.js';
+import type { Outbox } from '../services/outbox.js';
 import type { Context, JsonValue } from '@earendil-works/chord';
 import { defineTask, type Conversation, type Harness, type Tx } from '@earendil-works/pi-durable';
+import { Scheduler, type Clock } from '../runtime/scheduler.js';
 import { DomainStore } from './store.js';
 import { PolicyController } from './policy.js';
 import type { Actor, CommandMeta, DecisionOutcome, Policy } from './model.js';
 import { digest, normalizeEvent, scopedId, type AuditEvent, type IntakeIntent, type NormalizedEvent,
-  type ReceiveBatchResult, type ReceiveResult, type Source, type SourceCursor, type Thread, type Trigger } from './model.js';
+  type ReceiveBatchResult, type ReceiveResult, type Source, type SourceCursor, type Thread, type Trigger, type PreparedEvent } from './model.js';
 export type { Tx } from '@earendil-works/pi-durable';
 
 class PendingCapacity extends Error {}
@@ -31,6 +34,12 @@ export function createIntakeTask(store: DomainStore) {
 }
 export class Engine {
   readonly authorization = new PolicyController(this);
+  readonly lifecycle = new TicketLifecycle(this);
+  trackThread(ticketId: string, sourceId: string, threadRef: string, meta: CommandMeta) { return this.lifecycle.trackThread(ticketId, sourceId, threadRef, meta); }
+  readonly scheduler: Scheduler;
+  outbox?: Outbox;
+  /** Host preprocessing performs artifact IO before entering a transaction. */
+  prepareEvent?: (event: NormalizedEvent) => Promise<PreparedEvent>;
 
   updatePolicy(policy: Policy, actor: Actor, meta: CommandMeta) { return this.authorization.updatePolicy(policy, actor, meta); }
   listCandidates() { return this.authorization.listCandidates(); }
@@ -39,6 +48,7 @@ export class Engine {
   unsubscribe(ticketId: string, sourceId: string, threadRef: string, meta: CommandMeta) { return this.authorization.unsubscribe(ticketId, sourceId, threadRef, meta); }
   handback(ticketId: string, triggerId: string, epoch: number, reason: string, meta: CommandMeta) { return this.authorization.handback(ticketId, triggerId, epoch, reason, meta); }
   stopTicket(ticketId: string, actor: Actor, meta: CommandMeta) { return this.authorization.stopTicket(ticketId, actor, meta); }
+  retryTicket(ticketId: string, actor: Actor, meta: CommandMeta) { return this.authorization.retryTicket(ticketId, actor, meta); }
   endTicket(ticketId: string, epoch: number, meta: CommandMeta) { return this.authorization.endTicket(ticketId, epoch, meta); }
 
   constructor(
@@ -49,7 +59,8 @@ export class Engine {
     readonly instanceId: string,
     readonly maxPending = 10_000,
     private readonly intakeTask = createIntakeTask(store),
-  ) {}
+    clock?: Clock,
+  ) { this.scheduler = new Scheduler(this, clock); }
 
   /** Commit callbacks perform domain edits and create intents only; external IO belongs to tasks. */
   transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> { return this.control.commit(fn, this.context); }
@@ -72,7 +83,8 @@ export class Engine {
 
   async configureSource(source: Omit<Source, 'cursor'>): Promise<void> {
     if (!source.id?.trim() || !source.kind?.trim() || typeof source.enabled !== 'boolean' ||
-        (source.listenedScopes !== undefined && (!Array.isArray(source.listenedScopes) || source.listenedScopes.some((scope) => !scope?.trim())))) {
+        (source.listenedScopes !== undefined && (!Array.isArray(source.listenedScopes) || source.listenedScopes.some((scope) => !scope?.trim()))) ||
+        (source.repositoryAllowlist !== undefined && (!Array.isArray(source.repositoryAllowlist) || source.repositoryAllowlist.some(repository => typeof repository !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repository))))) {
       throw new Error('Invalid source configuration');
     }
     await this.transaction(async (tx) => {
@@ -80,13 +92,22 @@ export class Engine {
       await this.store.put(tx, 'source', source.id, {
         id: source.id, kind: source.kind, enabled: source.enabled,
         ...(source.listenedScopes === undefined ? {} : { listenedScopes: [...new Set(source.listenedScopes)] }),
+        ...(source.repositoryAllowlist === undefined ? {} : { repositoryAllowlist: [...new Set(source.repositoryAllowlist.map(repository => repository.toLowerCase()))] }),
         ...(existing?.cursor === undefined ? {} : { cursor: existing.cursor }),
       });
     });
   }
 
+  private async prepareNormalized(clean: NormalizedEvent): Promise<PreparedEvent> {
+    const { receivedAt: _receivedAt, ...stablePayload } = clean;
+    const originalDigest = digest(stablePayload);
+    const prepared = this.prepareEvent ? await this.prepareEvent(clean) : clean;
+    return { ...prepared, originalDigest };
+  }
+
   async receive(event: NormalizedEvent): Promise<ReceiveResult> {
-    const normalized = normalizeEvent(event);
+    const clean = normalizeEvent(event);
+    const normalized = await this.prepareNormalized(clean);
     try { return await this.transaction((tx) => this.receiveInTransaction(tx, normalized)); }
     catch (error) {
       if (error instanceof PendingCapacity) return { disposition: 'backpressure', retryable: true };
@@ -94,19 +115,26 @@ export class Engine {
     }
   }
 
-  async receiveBatch(events: NormalizedEvent[], cursor: SourceCursor): Promise<ReceiveBatchResult> {
+  async receiveBatch(events: NormalizedEvent[], cursor: SourceCursor, after?: (tx: Tx, results: ReceiveResult[]) => Promise<void>, options: { preserveCursor?: boolean; filterDisabled?: boolean } = {}): Promise<ReceiveBatchResult> {
     if (!cursor?.sourceId?.trim() || events.some((event) => event.sourceId !== cursor.sourceId)) {
       throw new Error('Batch events and cursor must have the same source');
     }
     digest(cursor.value);
-    const normalized = events.map(normalizeEvent);
+    const normalized = await Promise.all(events.map(async event => {
+      const clean = normalizeEvent(event);
+      return this.prepareNormalized(clean);
+    }));
     try {
       return await this.transaction(async (tx) => {
         const source = await this.store.get<Source>(tx, 'source', cursor.sourceId);
-        if (!source?.enabled) throw new Error('Batch cursor source is not enabled');
+        if (!source?.enabled) {
+          if (options.filterDisabled) return { disposition: 'stored', results: normalized.map(() => ({ disposition: 'filtered', sourceId: cursor.sourceId })) };
+          throw new Error('Batch cursor source is not enabled');
+        }
         const results: ReceiveResult[] = [];
         for (const event of normalized) results.push(await this.receiveInTransaction(tx, event));
-        await this.store.put(tx, 'source', source.id, { ...source, cursor: cursor.value });
+        await after?.(tx, results);
+        if (!options.preserveCursor) await this.store.put(tx, 'source', source.id, { ...source, cursor: cursor.value });
         return { disposition: 'stored', results };
       });
     } catch (error) {
@@ -115,13 +143,15 @@ export class Engine {
     }
   }
 
-  async receiveInTransaction(tx: Tx, event: NormalizedEvent): Promise<ReceiveResult> {
+  async receiveInTransaction(tx: Tx, event: PreparedEvent): Promise<ReceiveResult> {
     const id = scopedId(this.instanceId, 'trigger', [event.sourceId, event.externalId, event.revision]);
-    const { receivedAt: _receivedAt, ...stablePayload } = event;
-    const hash = digest(stablePayload);
+    const { originalDigest, ...storedEvent } = event;
+    const { receivedAt: _receivedAt, ...stablePayload } = storedEvent;
+    const storageDigest = digest(stablePayload);
+    const hash = originalDigest ?? storageDigest;
     const existing = await this.store.get<Trigger>(tx, 'trigger', id);
     if (existing) {
-      if (existing.digest !== hash) throw new Error(`Event payload conflict: ${id}`);
+      if (existing.digest !== hash && existing.digest !== storageDigest) throw new Error(`Event payload conflict: ${id}`);
       return { disposition: 'duplicate', triggerId: id };
     }
     const source = await this.store.get<Source>(tx, 'source', event.sourceId);
@@ -131,7 +161,7 @@ export class Engine {
     const state = await this.store.get<IntakeState>(tx, 'state', 'intake') ?? { count: 0, lastOrdinal: 0 };
     if (state.count >= this.maxPending) throw new PendingCapacity('Pending intake capacity exceeded');
     const ordinal = state.lastOrdinal + 1;
-    const trigger: Trigger = { ...event, id, ordinal, digest: hash };
+    const trigger: Trigger = { ...storedEvent, id, ordinal, digest: hash };
     await this.store.put(tx, 'trigger', id, trigger);
     const audit: AuditEvent = { id, kind: 'trigger.received', triggerId: id, occurredAt: event.receivedAt };
     await this.store.put(tx, 'audit', id, audit);
