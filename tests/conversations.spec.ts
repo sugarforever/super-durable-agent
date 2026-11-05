@@ -151,11 +151,17 @@ describe("native Router, ownerless Workers and durable delivery", () => {
         .map((t: any) => t.name)
         .sort(),
     ).toEqual([
+      "edit_file",
       "follow_for_context",
+      "get_job",
       "handback",
+      "read_file",
       "recall",
       "report",
+      "start_job",
+      "stop_job",
       "subscribe",
+      "write_file",
     ]);
     const records = await active.engine.transaction((tx: any) =>
       tx.scanConversations({}, 20),
@@ -903,7 +909,7 @@ describe("native Router, ownerless Workers and durable delivery", () => {
       tasks: Object.fromEntries(
         Object.entries(metadata.tasks).filter(
           ([name]) =>
-            !["sa.agentInput", "sa.cancel", "sa.redrive"].includes(name),
+            !["sa.agentInput", "sa.cancel", "sa.redrive", "sa.job", "sa.outbox"].includes(name),
         ),
       ),
     };
