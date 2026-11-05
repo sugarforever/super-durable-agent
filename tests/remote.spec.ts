@@ -248,11 +248,9 @@ describe("remote endpoint protocol", () => {
     expect(await f.broker.execute(request)).toMatchObject({
       status: "unknown",
     });
-    await delay(350);
     const restarted = new RemoteEnvironmentBroker(f.broker.options);
-    expect(await restarted.query("slow")).toMatchObject({
-      status: "completed",
-    });
+    await expect.poll(() => restarted.query("slow"), { timeout: 3000 })
+      .toMatchObject({ status: "completed" });
     expect(await restarted.execute(request)).toMatchObject({
       status: "completed",
     });
@@ -559,29 +557,44 @@ it("detects controller transport receipt corruption on restart", async () => {
   );
 });
 
-it("bounds streamed endpoint responses and times out while the body is still open", async () => {
+it("rejects oversized endpoint responses with 413 while the stream is still open", async () => {
   const { requestJson } = await import("../src/daemon/protocol.js");
+  let responseEnded = false;
   const server = createServer((req, res) => {
     req.resume();
     res.setHeader("content-type", "application/json");
-    if (req.url === "/oversize") res.write("x".repeat(1_048_577));
-    else res.write('{"open":');
+    res.on("close", () => { responseEnded = res.writableEnded; });
+    res.write("x".repeat(1_048_577));
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  cleanup.push(
-    () =>
-      new Promise<void>((resolve) => {
-        server.close(() => resolve());
-        server.closeAllConnections();
-      }),
-  );
+  cleanup.push(() => new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    server.closeAllConnections();
+  }));
   const url = `http://127.0.0.1:${(server.address() as any).port}`;
-  await expect(requestJson(url, "/oversize", "token", {}, 500)).rejects.toThrow(
-    /limit/i,
-  );
-  await expect(
-    requestJson(url, "/stalled-body", "token", {}, 30),
-  ).rejects.toThrow(/abort/i);
+  await expect(requestJson(url, "/oversize", "token", {}, 500))
+    .rejects.toMatchObject({ status: 413 });
+  expect(responseEnded).toBe(false);
+});
+
+it("times out after endpoint headers while the response body is still open", async () => {
+  const { requestJson } = await import("../src/daemon/protocol.js");
+  let headersSent = false;
+  const server = createServer((req, res) => {
+    req.resume();
+    res.setHeader("content-type", "application/json");
+    res.write('{"open":');
+    headersSent = true;
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  cleanup.push(() => new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    server.closeAllConnections();
+  }));
+  const url = `http://127.0.0.1:${(server.address() as any).port}`;
+  await expect(requestJson(url, "/stalled-body", "token", {}, 30))
+    .rejects.toMatchObject({ name: "AbortError" });
+  expect(headersSent).toBe(true);
 });
 
 it("splits outbound poll batches before the response byte limit without losing queued operations", async () => {

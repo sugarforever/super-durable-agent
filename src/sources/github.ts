@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { readResponseBytes } from "../http/response.js";
 import type {
   JsonValue,
   NormalizedEvent,
@@ -590,7 +591,9 @@ export class GitHubSource implements SourceAdapter {
           ...init.headers,
         },
       });
-      const data: unknown = await response.json();
+      const bytes = await readResponseBytes(response, controller.signal);
+      // Preserve native JSON decoding after the network body reached EOF.
+      const data: unknown = await new Response(new Uint8Array(bytes)).json();
       return {
         ok: response.ok,
         status: response.status,

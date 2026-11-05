@@ -17,6 +17,7 @@ import {
   type ReceiptLookup,
 } from "../services/outbox.js";
 import { equalSecret, secureUrl } from "../daemon/protocol.js";
+import { readResponseBytes } from "../http/response.js";
 export class FeishuError extends Error {
   constructor(
     readonly status: number,
@@ -495,17 +496,15 @@ export class FeishuSource implements SourceAdapter {
         signal: abort.signal,
         redirect: "error",
       });
-      const parts: Uint8Array[] = [];
-      let bytes = 0;
-      for await (const chunk of response.body ?? []) {
-        bytes += chunk.length;
-        if (bytes > 1_048_576) {
-          abort.abort();
-          throw new Error("Feishu response exceeds limit");
-        }
-        parts.push(chunk);
-      }
-      const data = JSON.parse(Buffer.concat(parts).toString("utf8"));
+      const bytes = await readResponseBytes(response, abort.signal, {
+        maxBytes: 1_048_576,
+        error: () => {
+          const error = new Error("Feishu response exceeds limit");
+          abort.abort(error);
+          return error;
+        },
+      });
+      const data = JSON.parse(bytes.toString("utf8"));
       if (!response.ok || data.code !== 0 || !identifier(data.data?.message_id))
         throw new Error("Feishu send outcome requires receipt inspection");
       const receipt = { messageId: data.data.message_id };
