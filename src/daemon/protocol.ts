@@ -3,6 +3,7 @@ import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { canonicalJson, digest } from "../domain/model.js";
+import { readResponseBytes } from "../http/response.js";
 export const BODY_LIMIT = 1_048_576;
 export const RESPONSE_LIMIT = 1_048_576;
 export class ProtocolError extends Error {
@@ -101,19 +102,17 @@ export async function requestJson(
       signal: abort.signal,
       redirect: "error",
     });
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    for await (const chunk of response.body ?? []) {
-      size += chunk.length;
-      if (size > RESPONSE_LIMIT) {
-        abort.abort();
-        throw new ProtocolError(413, "Response exceeds limit");
-      }
-      chunks.push(chunk);
-    }
+    const bytes = await readResponseBytes(response, abort.signal, {
+      maxBytes: RESPONSE_LIMIT,
+      error: () => {
+        const error = new ProtocolError(413, "Response exceeds limit");
+        abort.abort(error);
+        return error;
+      },
+    });
     let result: any;
     try {
-      result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      result = JSON.parse(bytes.toString("utf8"));
     } catch {
       throw new Error("Invalid endpoint response");
     }
@@ -125,6 +124,8 @@ export async function requestJson(
           : "Endpoint rejected request",
       );
     return result;
+  } catch (error) {
+    throw abort.signal.aborted ? abort.signal.reason : error;
   } finally {
     clearTimeout(timer);
   }

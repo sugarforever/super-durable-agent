@@ -1,4 +1,5 @@
 import { secureUrl, requestJson, RESPONSE_LIMIT } from "../daemon/protocol.js";
+import { readResponseBytes } from "../http/response.js";
 import {
   watchdogTick,
   WatchdogLedger,
@@ -22,26 +23,26 @@ export async function pollWatchdog(
   },
 ) {
   secureUrl(connection.url, connection.allowInsecureLoopback);
+  const signal = AbortSignal.timeout(10000);
   const response = await fetch(
     connection.url.replace(/\/$/, "") + "/taskGraph",
     {
       headers: { authorization: `Bearer ${connection.token}` },
-      signal: AbortSignal.timeout(10000),
+      signal,
       redirect: "error",
     },
   );
-  if (!response.ok)
-    throw Error(`Management snapshot rejected: ${response.status}`);
-  let size = 0;
-  const chunks: Uint8Array[] = [];
-  for await (const chunk of response.body ?? []) {
-    size += chunk.length;
-    if (size > RESPONSE_LIMIT) throw Error("Snapshot exceeds limit");
-    chunks.push(chunk);
+  if (!response.ok) {
+    const error = Error(`Management snapshot rejected: ${response.status}`);
+    // Reject status before parsing/draining, without waiting on body cleanup.
+    void response.body?.cancel(error).catch(() => {});
+    throw error;
   }
-  const snapshot = JSON.parse(
-    Buffer.concat(chunks).toString("utf8"),
-  ) as WatchdogSnapshot;
+  const bytes = await readResponseBytes(response, signal, {
+    maxBytes: RESPONSE_LIMIT,
+    error: () => Error("Snapshot exceeds limit"),
+  });
+  const snapshot = JSON.parse(bytes.toString("utf8")) as WatchdogSnapshot;
   if (
     !Array.isArray(snapshot.tickets) ||
     !Array.isArray(snapshot.jobs) ||
