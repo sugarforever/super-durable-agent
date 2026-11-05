@@ -1,0 +1,7 @@
+node_modules/
+.superpowers/
+dist/
+coverage/
+.data/
+.super-durable-agent/
+*.sqlite*

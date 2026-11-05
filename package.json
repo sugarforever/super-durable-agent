@@ -1,0 +1,31 @@
+{
+  "name": "super-durable-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Architecture and executable pi-durable contracts for a persistent super agent",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "verify:pi": "node scripts/verify-pi-contracts.mjs",
+    "test": "npm run build && vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "check:docs": "node scripts/check-docs.mjs",
+    "check": "npm run typecheck && npm test && npm run verify:pi && npm run check:docs"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-durable": "1.1.0",
+    "fs-ext": "2.1.1"
+  },
+  "devDependencies": {
+    "@types/fs-ext": "2.0.3",
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}
