@@ -2,6 +2,17 @@ import type { Context, JsonValue } from '@earendil-works/chord';
 import { defineDocFamily, type DocumentReader, type JsonObject, type SessionDocFamilyToken, type Tx } from '@earendil-works/pi-durable';
 import { canonicalJson } from './model.js';
 
+/** Version-one session families understood by this build. New persisted kinds require an explicit compatibility decision. */
+export const DOMAIN_RECORD_KINDS = new Set([
+  'agentState', 'assignment', 'audit', 'cancel', 'command', 'decision', 'delivery',
+  'deliveryRun', 'disposition', 'eval', 'evalQueue', 'feishuDelivery', 'feishuReceipt',
+  'feishuReplay', 'githubDelivery', 'intake', 'job', 'mandate', 'metadata', 'outbox',
+  'policy', 'policyRevision', 'redrive', 'report', 'reservation', 'routerBatch',
+  'routerClaim', 'routerNotice', 'scheduleRequest', 'scheduler', 'source',
+  'sourceThreadState', 'state', 'subscription', 'thread', 'ticket', 'trackedThread',
+  'trigger', 'workerBinding', 'workerContext', 'workerNote',
+]);
+
 const indexes = defineDocFamily({
   kind: 'sa.index', version: 1, scope: 'session', family: true,
   initial: (_seed: string): { ids: string[] } => ({ ids: [] }),
@@ -46,6 +57,18 @@ export class DomainStore {
     }
     document.present = true;
     document.value = JSON.parse(encoded) as JsonValue;
+  }
+
+  /** Enumerate the bounded index inside the same transaction as subsequent mutations. */
+  async listInTransaction<T>(tx: Tx, kind: string): Promise<T[]> {
+    family(kind);
+    const index = await tx.doc(indexes, kind, kind);
+    const values: T[] = [];
+    for (const id of index.ids) {
+      const value = await this.get<T>(tx, kind, id);
+      if (value !== undefined) values.push(value);
+    }
+    return values;
   }
 
   async read<T>(kind: string, id: string): Promise<T | undefined> {

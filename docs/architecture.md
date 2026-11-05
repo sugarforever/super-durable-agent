@@ -127,13 +127,13 @@ Models propose structured accept/attach/ignore/stop decisions. Engine rechecks c
 
 Policy changes invalidate unfinished Eval epochs and enqueue reevaluation; late results are rejected. Notify affected active Tickets without replacing their Mandate through ordinary context. Revalidate ended work before resumption. Explicit stop immediately withdraws authority. Endpoint access revocation is also immediate.
 
-Capabilities include `repo.read`, `repo.write`, `command.execute`, `pr.create`, `pr.merge`, and `channel.reply`. A gateway validates repository, endpoint, operation, budget, epoch, and capability. Natural-language scope remains a model-assisted judgment, not a formal authorization proof.
+Capabilities include `repo.read`, `repo.write`, `command.execute`, `pr.create`, `pr.merge`, and `channel.reply`. A gateway validates repository, endpoint, operation, budget, epoch, and capability. Natural-language scope remains a model-assisted judgment, not a formal authorization proof. These fine-grained checks describe structured gateways. An explicitly enabled trusted local shell can use the OS account’s network and credentials; command.execute in that mode is a broad grant and cannot enforce a separate no-merge guarantee. Enforce such boundaries with an isolated execution identity/sandbox or leave broad shell disabled.
 
 ## Atomic acceptance and delivery
 
 One acceptance commit creates Decision, Mandate, Ticket, own subscriptions, Assignment, queue indexes, and optional acknowledgement intent. Preparation runs afterward in a Drive Task. Commit callbacks perform no external IO and never nest `Conversation.submit()`.
 
-Worker creation, transactional configure, and Ticket binding happen in one commit and are idempotent. Workers are ownerless; Control owns the background coordination tasks. Drive checkpoints are **reserve → prepare → ensureWorker → enqueueDelivery → done**. Completing Drive does not release capacity while generation or Jobs still run. Prepare uses an operation receipt; unknown filesystem results are inspected rather than overwritten.
+Worker creation, transactional configure, and Ticket binding happen in one commit and are idempotent. Workers are ownerless; Control owns the background coordination tasks. Conversation dispatch checkpoints are **reserve → prepare Worker context → ensureWorker → enqueueDelivery → done**. Environment preparation is lazy on the first broker operation, under the already-held reservation; reasoning-only work need not create a worktree. Completing dispatch does not release capacity while generation or Jobs still run. Environment preparation uses an operation receipt; unknown filesystem results are inspected rather than overwritten.
 
 ```mermaid
 sequenceDiagram
@@ -181,7 +181,7 @@ stateDiagram-v2
   person --> stopped: Authenticated stop
 ```
 
-Worker `report` accepts progress/waiting/ready/blocked/failed/dropped and questions. Validate Worker binding, Ticket, assignmentEpoch, reportId, and consumed input IDs. Plain final prose is not ready; without a structured Report, conservatively record waiting or attention. Ready means reviewable, not accepted. An open tracked PR keeps the Ticket open. Closure/merge ends work only if no pending followup or newer execution remains. Untracked one-shot work can end under an explicit acceptance policy.
+Worker `report` accepts progress/waiting/ready/blocked/failed/dropped and questions. Validate Worker binding, Ticket, assignmentEpoch, reportId, and consumed input IDs. Plain final prose is not ready; without a structured Report, conservatively record waiting or attention. Ready means reviewable, not accepted. An open tracked PR keeps the Ticket open. Closure/merge ends work only if no pending followup, newer execution, active/unknown Job, or unsettled current final-message obligation remains. Untracked one-shot work can end under an explicit acceptance policy.
 
 Reports/questions/artifacts go through purpose-aware Outbox. Keep tool logs internal; IM replies are concise, GitHub descriptions include the problem/change/validation. Silence rules suppress unnecessary acknowledgements and progress. Routine progress need not wake Router.
 
@@ -191,7 +191,7 @@ A durable tool Task does not make its generation loop nonblocking: the loop stil
 
 Stop Job cancels that operation; stop Ticket withdraws its Mandate and cancels all owned operations. `replay: safe` is allowed only for receipt-backed or genuinely read-only operations. Arbitrary shell, messages, and PR merges are not made exactly-once by an annotation. Interrupted unknown shell work requires receipt/environment inspection before retry.
 
-Local broker preparation creates Ticket-specific worktrees. **A worktree is not a sandbox.** The first local command executor is an explicitly enabled trusted-local-shell mode: authorizing it grants the OS account's command/file/network reach. Repository path guards on structured read/write operations do not confine shell subprocesses. Do not advertise branch/filesystem/network confinement for that mode. Untrusted execution requires a separately configured OS/container sandbox and credentials boundary; fail closed if such confinement is requested but unavailable. Test path/symlink escapes for structured operations and test that untrusted shell is refused by default.
+Local broker preparation creates Ticket-specific worktrees. The physical workspace is keyed by Ticket and canonical repository, while each Assignment/epoch retains a separate immutable lease and operation identity. Natural resumption and explicit retry preserve committed and dirty work under fresh authorization. A mismatched requested base or an active/unknown prior lease blocks reuse; stale release or cancellation cannot remove or authorize the current lease. **A worktree is not a sandbox.** The first local command executor is an explicitly enabled trusted-local-shell mode: authorizing it grants the OS account's command/file/network reach. Repository path guards on structured read/write operations do not confine shell subprocesses. Do not advertise branch/filesystem/network confinement for that mode. Untrusted execution requires a separately configured OS/container sandbox and credentials boundary; fail closed if such confinement is requested but unavailable. Test path/symlink escapes for structured operations and test that untrusted shell is refused by default.
 
 EnvironmentBroker exposes prepare/execute/query/cancel/release. Mutating requests carry operationId, payload digest, assignmentEpoch, and explicit authorization. Credentials are resolved by the broker without entering model context. The remote daemon retains a minimal durable operation ledger and receipts, not conversation history, so reconnect can query rather than repeat unknown commands.
 
@@ -234,9 +234,9 @@ Pi restores checkpoints/inbox/generation/tool state. Reconciler repairs domain/e
 | Missing definition/migration failure | Fail closed with diagnostics and recovery instructions |
 | Endpoint disconnected/cancel pending | Query on reconnect; do not repeat unknown operation |
 
-Pi Task `waiting.on` refers to Task IDs, not arbitrary domain events. External waiting is represented in documents and awakened by new intake/dispatch. Delays persist nextAttemptAt in checkpoints and use runtime.sleep; memory-only timers are insufficient after restart.
+Pi Task `waiting.on` refers to Task IDs, not arbitrary domain events. External waiting is represented in documents and awakened by new intake/dispatch. Continuing Task delays persist their deadline in checkpoints and use runtime.sleep. Deferred Outbox intents instead persist nextAttemptAt transactionally and use finite sender Tasks when due; startup and explicit reconciliation recover due work. An unreferenced host timer may wake that reconciler, but never owns retry state. Memory-only timers are insufficient after restart.
 
-SQLite WAL/NORMAL supports process-crash recovery but does not promise zero loss on power/host failure. Backup/restore must capture a consistent database plus artifacts and compatible definitions; restore into a new directory and verify before replacing service state. A corrupt/unsupported store is not silently initialized as empty.
+SQLite WAL/NORMAL supports process-crash recovery but does not promise zero loss on power/host failure. Backup/restore must capture a consistent database plus artifacts and compatible definitions; restore into a new directory and verify before replacing service state. Endpoint operation admissions and receipts are independent safety-critical state: preserve/validate local broker ledgers and repository dependencies, or require reconciliation with the original endpoint before resuming active Jobs. An empty replacement broker is not evidence that an old command was never launched. A corrupt/unsupported store is not silently initialized as empty.
 
 Future cloud deployment still needs one active writer per Session. Pi 1.1.0 provides no cross-process ownership lease or distributed SQLite writer election; external leases/fencing/storage failover are prerequisites, not implied capabilities.
 

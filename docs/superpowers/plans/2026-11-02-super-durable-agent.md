@@ -35,11 +35,11 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Acceptance:** Documentation links and language audit; pi contract probes; review traceability with no unsupported production claims.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Characterize the pinned public pi APIs and audit the English design baseline; no runtime feature readiness is inferred.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 2: Persistent domain kernel and single-writer runtime
 
@@ -53,11 +53,11 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Acceptance:** Duplicate versus edited event; conflicting idempotency keys rejected; rollback of documents and tasks; no second writer; CLI round trip and SQLite reopen.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 3: Authorization and subscription ownership
 
@@ -67,15 +67,15 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Outcome:** Policy off/observe/auto, explicit versus inferred admission, Mandates and capability upper bounds, accept/attach/ignore/stop, own/context-only subscriptions, multi-owner handback and policy epochs.
 
-**Interfaces:** Consumes the public interfaces introduced by parts 2–2 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. No parallel store or scheduler is permitted.
+**Interfaces:** Consumes the public interfaces introduced by parts 2–2 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. The supervisor owns only its diagnostic ledger; domain state and execution continue through the existing Engine/Harness, with no parallel domain store or scheduler.
 
 **Acceptance:** Authorization matrix; no new Eval for owned human feedback; bot evaluation independent of fanout; last-owner handback; revocation and stale-decision rejection.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 4: Router and Worker conversations with durable delivery
 
@@ -85,15 +85,15 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Outcome:** Explicit role extension/tool allowlists, one long-lived Router, bounded batching and recall, ownerless Workers, transactional configure, payload-bound Delivery requestIds, busy steer/followUp semantics, structured reports and failure recovery.
 
-**Interfaces:** Consumes the public interfaces introduced by parts 2–3 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. No parallel store or scheduler is permitted.
+**Interfaces:** Consumes the public interfaces introduced by parts 2–3 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. The supervisor owns only its diagnostic ledger; domain state and execution continue through the existing Engine/Harness, with no parallel domain store or scheduler.
 
 **Acceptance:** Controlled provider runs real pi generation; isolated Worker history; Router cancellation independence; crash after input admission; placed versus application-consumed evidence; no implicit ready.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 5: Capacity scheduling and cancellation fencing
 
@@ -103,15 +103,15 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Outcome:** Persistent three-normal-plus-one-human reservations, preparation accounting, aging, Drive, precise stopping and cancel intents, startup reconciliation and assignmentEpoch fencing.
 
-**Interfaces:** Consumes the public interfaces introduced by parts 2–4 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. No parallel store or scheduler is permitted.
+**Interfaces:** Consumes the public interfaces introduced by parts 2–4 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. The supervisor owns only its diagnostic ledger; domain state and execution continue through the existing Engine/Harness, with no parallel domain store or scheduler.
 
 **Acceptance:** No oversubscription after restart; ordinary work cannot consume human reserve; no duplicate capacity for steer; old report cannot revive Ticket; cancellation receipts reconcile accounting without new progress.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 6: Local environments and asynchronous jobs
 
@@ -121,15 +121,15 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Outcome:** EnvironmentBroker, idempotent worktree preparation, durable operation ledger, start/get/stop Job tools, completion triggers and command boundary enforcement.
 
-**Interfaces:** Consumes the public interfaces introduced by parts 2–5 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. No parallel store or scheduler is permitted.
+**Interfaces:** Consumes the public interfaces introduced by parts 2–5 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. The supervisor owns only its diagnostic ledger; domain state and execution continue through the existing Engine/Harness, with no parallel domain store or scheduler.
 
 **Acceptance:** Real temporary repository and subprocess execution; payload-bound operation IDs; long job does not block feedback; cancellation and unknown-outcome recovery; explicit trusted-local-shell boundary.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 7: Transactional Outbox and external effect recovery
 
@@ -139,15 +139,15 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Outcome:** Fenced outbound messages with Ticket, Mandate, epoch and payload digest; receipt lookup, bounded exponential retry, source availability/listening policy and uncertain outcomes.
 
-**Interfaces:** Consumes the public interfaces introduced by parts 2–6 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. No parallel store or scheduler is permitted.
+**Interfaces:** Consumes the public interfaces introduced by parts 2–6 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. The supervisor owns only its diagnostic ledger; domain state and execution continue through the existing Engine/Harness, with no parallel domain store or scheduler.
 
 **Acceptance:** Stop between enqueue and send prevents send; old messages remain fenced after reopen; found/absent/unknown receipt cases; 2s-to-60s backoff and eight-failure attention.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 8: CLI, GitHub integration and management API
 
@@ -157,15 +157,15 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Outcome:** Runnable service/CLI, authenticated management reads and controls, verified GitHub webhooks, polling cursors, reply-loop suppression and ready-versus-closed Ticket lifecycle.
 
-**Interfaces:** Consumes the public interfaces introduced by parts 2–7 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. No parallel store or scheduler is permitted.
+**Interfaces:** Consumes the public interfaces introduced by parts 2–7 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. The supervisor owns only its diagnostic ledger; domain state and execution continue through the existing Engine/Harness, with no parallel domain store or scheduler.
 
 **Acceptance:** Webhook signature failure never admits events; cursor commits atomically; API actor cannot be forged in body; ready PR stays open; merge with unread followup does not end work.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 9: Remote endpoint daemon and Feishu integration
 
@@ -175,33 +175,33 @@ Protect multi-owner handback, admission-before-receipt crashes, stale reports an
 
 **Outcome:** Authenticated outbound endpoint protocol, minimal execution receipt ledger, capability/epoch fencing, reconnect query rather than blind restart; authenticated Feishu intake and outbound adapter.
 
-**Interfaces:** Consumes the public interfaces introduced by parts 2–8 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. No parallel store or scheduler is permitted.
+**Interfaces:** Consumes the public interfaces introduced by parts 2–8 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. The supervisor owns only its diagnostic ledger; domain state and execution continue through the existing Engine/Harness, with no parallel domain store or scheduler.
 
 **Acceptance:** Offline/reconnect retains operation identity; duplicate remote execution rejected; endpoint revocation rejects new jobs; webhook/event authentication; Feishu receipt uncertainty visible.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Task 10: Independent Watchdog and operational recovery
 
 **Issue:** [#10](https://github.com/sugarforever/super-durable-agent/issues/10). **Branch:** `codex/10-watchdog-operations`. **Base:** `codex/09-remote-feishu`.
 
-**Files:** `src/watchdog/index.ts`, `docs/operations.md`, `tests/watchdog.spec.ts`, `tests/recovery.spec.ts`.
+**Files:** `src/watchdog/{core,runner,semantic,cli}.ts`, `src/runtime/{backup,migrations}.ts`, `docs/operations.md`, `tests/watchdog.spec.ts`, `tests/recovery.spec.ts`, and cross-layer Job/remote integration tests.
 
 **Outcome:** Independent supervisor storage and budget, health and semantic-progress classification, quiet unchanged monitoring, constrained actions, backup/restore and migration procedures; full-stack acceptance.
 
-**Interfaces:** Consumes the public interfaces introduced by parts 2–9 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. No parallel store or scheduler is permitted.
+**Interfaces:** Consumes the public interfaces introduced by parts 2–9 and extends the same Engine/Harness; exact exports and integration examples must be recorded with this PR. The supervisor owns only its diagnostic ledger; domain state and execution continue through the existing Engine/Harness, with no parallel domain store or scheduler.
 
 **Acceptance:** Waiting for people/endpoints/long jobs is not a stall; repeated no-progress becomes a candidate; no repeated unchanged notification; fail-closed migrations and restore; final offline E2E and documented live-account limitations.
 
-- [ ] Add behavioral tests first and confirm the intended missing behavior fails.
-- [ ] Implement the scoped feature and required integration through existing public boundaries.
-- [ ] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
-- [ ] Obtain an independent scoped review; fix important findings and record limitations.
-- [ ] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
+- [x] Add behavioral tests first and confirm the intended missing behavior fails.
+- [x] Implement the scoped feature and required integration through existing public boundaries.
+- [x] Run targeted tests, the full suite, typecheck/build where introduced, documentation checks, and pi probes.
+- [x] Obtain an independent scoped review; fix important findings and record limitations.
+- [x] Commit/push only this requirement on its branch; open its linked incremental PR; update checkpoint evidence.
 
 ## Completion rules
 
