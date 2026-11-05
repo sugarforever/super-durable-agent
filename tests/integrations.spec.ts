@@ -1622,3 +1622,23 @@ it("outbound GitHub fails closed without a configured own login while receipt in
   expect(posts).toBe(0);
   expect(await a.queryReceipt("key")).toEqual({ status: "unknown" });
 });
+
+it.each([true, false])('suppresses legacy GitHub question webhook echoes across the renderer upgrade (known receipt=%s)', async (knownReceipt) => {
+  const { r } = await setup();
+  const a = await github(r, { ownLogins: ['agent-user'], addressed: true });
+  resources.push(async () => a.close());
+  await r.updatePolicy(policy, operator, { commandId: 'policy' });
+  const initial = raw(payload()); await a.webhook(r, initial, headers(initial));
+  const [candidate] = await r.listCandidates();
+  await r.decide(candidate.id, candidate.epoch, { kind: 'accept', goal: 'Legacy question', ruleIds: [] }, { commandId: 'accept' });
+  const [ticket] = await r.list<any>('ticket');
+  await r.engine.transaction(async tx => {
+    const message = await r.outbox.enqueueMessage(tx, { ticketId: ticket.id, mandateId: ticket.mandateId, assignmentEpoch: 1, purpose: 'question', destination: { sourceId: 'github', threadRef: 'acme/repo#1' }, payload: { content: 'I need one decision.', questions: [{ id: 'branch', text: 'Which branch?', options: ['main', 'release'] }] }, idempotencyKey: 'legacy-question' });
+    if (knownReceipt) await r.engine.store.put(tx, 'outbox', message.id, { ...message, status: 'sent', receipt: { id: 42 } });
+  });
+  const own = { login: 'agent-user', type: 'User' };
+  const echo = raw(payload({ action: 'created', sender: own, comment: { id: 42, user: own, body: `## Agent question\n\nI need one decision.\n\n${a.marker('legacy-question')}`, created_at: '2026-01-01T00:01:00Z' } }));
+  const triggers = await r.list('trigger'), deliveries = await r.list('delivery');
+  expect((await a.webhook(r, echo, headers(echo, 'issue_comment', 'legacy-question-echo'))).results).toEqual([]);
+  expect(await r.list('trigger')).toEqual(triggers); expect(await r.list('delivery')).toEqual(deliveries);
+});

@@ -135,7 +135,7 @@ export type DecisionOutcome =
 export interface Decision { id: ID; evalId: ID; epoch: number; policyVersion: number; outcome: DecisionOutcome }
 export interface DeliveryIntent {
   id: ID; ticketId: ID; triggerId: ID; epoch: number; own: boolean; resume: boolean;
-  status: 'pending' | 'delivered' | 'invalid'; ownershipOf?: ID; mode?: 'followUp' | 'steer';
+  status: 'pending' | 'delivered' | 'retained' | 'invalid'; ownershipOf?: ID; mode?: 'followUp' | 'steer';
 }
 export interface CancelIntent { id: ID; ticketId: ID; assignmentId: ID; epoch: number; status: 'pending' | 'completed' | 'attention'; reason: string; cancelKey?: string; payloadDigest?: string; nativeConfirmed?: boolean; endpointConfirmed?: boolean; taskId?: TaskId<null>; attempts?: number }
 export type ReportStatus = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped' | 'attention';

@@ -1359,18 +1359,22 @@ for (const mode of ["http", "poll"] as const) {
 for (const mode of ["http", "poll"] as const) it(`${mode}: late query receipt after stop remains accounting-only`, async () => {
   const { alice } = await import("./helpers/scheduling.js");
   const f = await nativeRemote(mode, true);
+  const queryObservations: { status?: string; at: number }[] = [];
   const waitFor = async (fn: () => Promise<boolean>) => {
     for (let n = 0; n < 1000; n++) { if (await fn()) return; await delay(10); }
-    throw Error("Late accounting did not settle");
+    const job = await f.r.engine.store.read<any>('job', f.firstJob.id);
+    throw Error(`Late accounting did not settle: ${JSON.stringify({ status: job?.status, queryAttempts: job?.receiptQueryAttempts, queryDueIn: job?.receiptQueryAt - Date.now(), queryObservations })}`);
   };
   await waitFor(async () => (await f.r.engine.store.read<any>("job", f.firstJob.id))?.status === "unknown");
   f.release();
-  await f.restart();
+  // Install the observation barrier before any recovered native query can run.
+  await f.restart(true);
   const query = f.broker.query.bind(f.broker);
   let entered = false, release!: () => void;
   const gate = new Promise<void>(resolve => release = resolve);
   f.broker.query = async id => {
     const receipt = await query(id);
+    if (id === f.firstJob.operationId) queryObservations.push({ status: receipt?.status, at: Date.now() });
     if (id === f.firstJob.operationId && receipt?.status === "completed" && !entered) {
       entered = true; await gate;
     }
@@ -1378,6 +1382,14 @@ for (const mode of ["http", "poll"] as const) it(`${mode}: late query receipt af
   };
   try {
     await writeFile(join(f.root, "finish-job"), "go");
+    await waitFor(async () => (await f.daemon.broker.query(f.firstJob.operationId))?.status === 'completed');
+    // This test exercises late accounting, not wall-clock exponential backoff.
+    await f.r.engine.transaction(async tx => {
+      const job = (await f.r.engine.store.get<any>(tx, 'job', f.firstJob.id))!;
+      await f.r.engine.store.put(tx, 'job', job.id, { ...job, receiptQueryAt: 0 });
+    });
+    await f.r.agents!.jobs.receipts.reconcile();
+    await f.r.activate();
     await waitFor(async () => entered);
     expect((await f.r.engine.store.read<any>("job", f.firstJob.id)).receiptTaskId).toBeTruthy();
     await f.r.agents!.close();
@@ -1392,3 +1404,75 @@ for (const mode of ["http", "poll"] as const) it(`${mode}: late query receipt af
     expect(await readFile(join(f.root, "native-begun"), "utf8")).toBe("begun");
   } finally { release(); f.broker.query = query; }
 }, 25000);
+
+for (const mode of ['http', 'poll'] as const) {
+  it(`${mode}: durably cancels a target before delayed transport authorization admits it`, async () => {
+    const f = await fixture(mode);
+    const request = f.request('pre-admission-cancel', { kind: 'shell', command: 'printf unsafe > late-effect' });
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(r => enter = r), gate = new Promise<void>(r => release = r);
+    const authorize = f.broker.options.authorize;
+    f.broker.options.authorize = async (i, action) => {
+      const grant = await authorize(i, action);
+      if (action === 'execute') { enter(); await gate; }
+      return grant;
+    };
+    const execution = f.broker.execute(request);
+    await entered;
+    try {
+      expect(await f.broker.cancel(request.operationId, 1, request)).toMatchObject({ status: 'cancelled' });
+      expect(await f.broker.query(request.operationId)).toMatchObject({ status: 'cancelled' });
+    } finally { release(); await execution; }
+    const reopened = new RemoteEnvironmentBroker({ ...f.broker.options, authorize });
+    expect(await reopened.query(request.operationId)).toMatchObject({ status: 'cancelled' });
+    expect(await reopened.execute(request)).toMatchObject({ status: 'cancelled' });
+    await expect(readFile(join(f.prepared.cwd, 'late-effect'))).rejects.toThrow();
+    expect(await f.broker.execute(f.request('unrelated-after-operation-cancel', { kind: 'write', path: 'file', text: 'still authorized' }))).toMatchObject({ status: 'completed' });
+  });
+
+  it(`${mode}: stop_job fences a native Job while its transport grant is delayed`, async () => {
+    const { openSuperAgent } = await import('../src/runtime/open.js');
+    const { createModels } = await import('@earendil-works/pi-ai/models');
+    const { fauxProvider, fauxAssistantMessage, fauxToolCall } = await import('@earendil-works/pi-ai/providers/faux');
+    const { accept, alice, isRouter, until } = await import('./helpers/scheduling.js');
+    const f = await fixture(mode), directory = join(f.root, 'runtime');
+    let r = await openSuperAgent({ directory });
+    await r.updatePolicy({ version: 1, acceptMode: 'auto', allowedActors: ['alice'], botActors: [], explicitCapabilities: capabilities, rules: [] }, alice, { commandId: 'policy' });
+    const ticket = await accept(r, 'native-cancel');
+    await r.close();
+    const faux = fauxProvider(), models = createModels(); models.setProvider(faux.provider);
+    let first = true;
+    const effect = join(f.root, 'job-late-effect');
+    faux.setResponses(Array.from({ length: 50 }, () => (ctx: any) => {
+      if (isRouter(ctx)) return fauxAssistantMessage('No decision');
+      if (first) { first = false; return fauxAssistantMessage(fauxToolCall('start_job', { assignmentId: ticket.assignmentId, epoch: 1, command: `printf unsafe > '${effect}'` }), { stopReason: 'toolUse' }); }
+      return fauxAssistantMessage('Observe cancellation');
+    }));
+    r = await openSuperAgent({ directory, startPaused: true, models, model: { provider: faux.getModel().provider, modelId: faux.getModel().id }, environment: { broker: f.broker } });
+    cleanup.push(() => r.close());
+    f.daemonOptions.authorize = (i, action) => r.agents!.jobs.authorize(i, action);
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => enter = resolve), gate = new Promise<void>(resolve => release = resolve);
+    const authorize = f.broker.options.authorize;
+    f.broker.options.authorize = async (i, action) => { const grant = await authorize(i, action); if (action === 'execute') { enter(); await gate; } return grant; };
+    await r.activate(); await entered;
+    const job = (await r.list<any>('job'))[0], current = await r.readTicket<any>(ticket.id);
+    const stopping = r.agents!.jobs.stop(current.workerConversationId, job.id);
+    try {
+      await until(async () => (await r.list<any>('job'))[0]?.status === 'cancelled');
+      expect(await f.broker.query(job.operationId)).toMatchObject({ status: 'cancelled' });
+    } finally { release(); await stopping; await r.agents!.waitForIdle(); }
+    expect((await r.list<any>('job'))[0]).toMatchObject({ status: 'cancelled', receipt: { status: 'cancelled' } });
+    await expect(readFile(effect)).rejects.toThrow();
+  });
+}
+
+for (const mode of ['http', 'poll'] as const) it(`${mode}: pre-admission Ticket cancellation still revokes the whole epoch`, async () => {
+  const f = await fixture(mode);
+  f.daemonOptions.authorize = async (i, action) => ({ ...i, capabilities, ...(action === 'cancel' ? { revokeEpoch: true as const } : {}) });
+  const request = f.request('pre-admission-ticket-stop', { kind: 'shell', command: 'printf unsafe > ticket-stop-effect' });
+  expect(await f.broker.cancel(request.operationId, 1, request)).toMatchObject({ status: 'cancelled' });
+  await expect(f.broker.execute(f.request('other-old-epoch-operation', { kind: 'write', path: 'file', text: 'unsafe' }))).rejects.toThrow(/fenced|revoked|rejected/i);
+  expect(await readFile(join(f.prepared.cwd, 'file'), 'utf8')).toBe('base');
+  await expect(readFile(join(f.prepared.cwd, 'ticket-stop-effect'))).rejects.toThrow();
+});

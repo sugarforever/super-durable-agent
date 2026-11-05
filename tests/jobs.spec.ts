@@ -418,3 +418,20 @@ describe('Ticket workspace continuity',()=>{
    expect(await f.broker.execute({operationId:'fresh-write',identity:next,payload:p,payloadDigest:operationDigest(next,p)})).toMatchObject({status:'completed'});
  });
 });
+
+it('preserves existing modes through atomic structured writes and edits without following symlinks', async () => {
+  const { chmod, stat } = await import('node:fs/promises');
+  const f = await repo();
+  for (const kind of ['write', 'edit'] as const) for (const mode of [0o755, 0o640]) {
+    const path = `${kind}-${mode}`; await writeFile(join(f.prepared.cwd, path), 'original'); await chmod(join(f.prepared.cwd, path), mode);
+    const action = kind === 'write' ? { kind, path, text: 'updated' } : { kind, path, oldText: 'original', newText: 'updated' };
+    expect(await f.broker.execute(f.request(path, action))).toMatchObject({ status: 'completed' });
+    expect((await stat(join(f.prepared.cwd, path))).mode & 0o777).toBe(mode);
+    expect(await readFile(join(f.prepared.cwd, path), 'utf8')).toBe('updated');
+  }
+  expect(await f.broker.execute(f.request('new-conservative', { kind: 'write', path: 'new-conservative', text: 'new' }))).toMatchObject({ status: 'completed' });
+  expect((await stat(join(f.prepared.cwd, 'new-conservative'))).mode & 0o777).toBe(0o600);
+  await symlink(join(f.prepared.cwd, 'source.txt'), join(f.prepared.cwd, 'linked'));
+  for (const kind of ['write', 'edit']) await expect(f.broker.execute(f.request(`linked-${kind}`, { kind, path: 'linked', text: 'unsafe', oldText: 'original', newText: 'unsafe' }))).rejects.toThrow(/symlink/);
+  expect(await readFile(join(f.prepared.cwd, 'source.txt'), 'utf8')).toBe('original');
+});

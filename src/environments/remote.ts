@@ -415,9 +415,7 @@ export class RemoteEnvironmentBroker implements EnvironmentBroker {
         }
         return (
           receipt ??
-          (record?.delivered
-            ? (record.receipt ?? this.unknown(record))
-            : undefined)
+          (record?.receipt ?? (record?.delivered ? this.unknown(record) : undefined))
         );
       } catch (error) {
         if (this.continuityLost && record) return this.unknown(record);
@@ -430,8 +428,25 @@ export class RemoteEnvironmentBroker implements EnvironmentBroker {
     // Poll receipts are returned by the daemon's ledger after every reconnect.
     return record ? (record.receipt ?? this.unknown(record)) : undefined;
   }
-  async cancel(operationId: string, epoch: number): Promise<ExecutionReceipt> {
+  async cancel(operationId: string, epoch: number, target?: ExecuteRequest): Promise<ExecutionReceipt> {
     await this.ready();
+    if (target) {
+      if (target.operationId !== operationId || target.identity.epoch !== epoch ||
+          !['shell', 'read', 'write', 'edit'].includes(target.payload.kind) ||
+          target.payloadDigest !== operationDigest(target.identity, target.payload))
+        throw new Error("Cancellation target conflict");
+      await this.options.authorize(target.identity, 'cancel');
+      // Persist the same execute identity before acknowledging cancellation. A
+      // delayed authorization callback must encounter this tombstone on admission.
+      await this.ledger.serial(operationId, async () => {
+        const command: RemoteCommand = { id: operationId, action: 'execute', body: target,
+          identity: target.identity, digest: digest({ action: 'execute', body: target, identity: target.identity }) };
+        const previous = await this.ledger.read(operationId);
+        if (previous && previous.command.digest !== command.digest) throw new Error("Cancellation target conflict");
+        if (!previous) await this.persist({ command, receipt: { operationId, identity: target.identity,
+          payloadDigest: target.payloadDigest, status: 'cancelled', reason: 'Cancelled before transport admission' } });
+      });
+    }
     const original = this.records.get(operationId);
     if (!original || original.command.identity.epoch !== epoch)
       throw new Error("Unknown operation or epoch conflict");

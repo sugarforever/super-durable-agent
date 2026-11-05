@@ -148,9 +148,13 @@ export class Jobs {
     const job = await this.engine.store.read<Job>('job', id);
     if (!job || ['completed','failed','cancelled'].includes(job.status)) return;
     const prior = await this.endpoint().query(job.operationId);
-    if (prior) await this.finish(id, await this.endpoint().cancel(job.operationId, job.epoch));
-    else {
-      // No endpoint admission and the native task is being aborted: no external command was launched.
+    if (prior || job.payload && job.payloadDigest) {
+      const target = job.payload && job.payloadDigest ? { operationId: job.operationId, identity: job.identity,
+        payload: job.payload, payloadDigest: job.payloadDigest } : undefined;
+      await this.finish(id, await this.endpoint().cancel(job.operationId, job.epoch, target));
+    } else {
+      // No execute payload was committed. run() must recheck this terminal status
+      // before it can commit a payload or call the endpoint after preparation.
       await this.finish(id, { operationId: job.operationId, identity: job.identity, payloadDigest: job.payloadDigest ?? job.commandDigest, status: 'cancelled', reason: 'Cancelled before endpoint admission' });
     }
   }

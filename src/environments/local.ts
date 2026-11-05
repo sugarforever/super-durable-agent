@@ -291,9 +291,12 @@ export class LocalEnvironmentBroker implements EnvironmentBroker {
           if (Buffer.byteLength(text) > FILE_LIMIT) throw new Error('Structured write exceeds byte limit');
           // Validate again immediately before the atomic replacement. Never follow target symlinks.
           await this.path(environment.cwd, p.path);
+          let mode = 0o600;
+          try { mode = (await lstat(target!)).mode & 0o777; }
+          catch (error: any) { if (error.code !== 'ENOENT') throw error; }
           const temp = join(dirname(target!), `.sa-write-${randomUUID()}`);
           const handle = await open(temp, 'wx', 0o600);
-          try { await handle.writeFile(text); await handle.sync(); } finally { await handle.close(); }
+          try { await handle.writeFile(text); await handle.chmod(mode); await handle.sync(); } finally { await handle.close(); }
           try { await this.path(environment.cwd, p.path); await rename(temp, target!); }
           finally { await unlink(temp).catch(() => {}); }
           receipt = { ...identity, status: 'completed', result: { bytes: Buffer.byteLength(text) } };
