@@ -195,11 +195,14 @@ export class Outbox {
       if (!communicates(current.purpose, rules)) {
         await this.engine.store.put(tx, 'outbox', id, { ...current, status: 'dropped', error: 'Communication rule suppresses routine message', nextAttemptAt: 0 }); return;
       }
-      if (!source || source.listenedScopes !== undefined && !source.listenedScopes.includes(current.destination.threadRef) || !adapter.listened(current.destination)) {
+      if (!source || source.listenedScopes !== undefined && !source.listenedScopes.includes(current.destination.threadRef)) {
         await this.engine.store.put(tx, 'outbox', id, { ...current, status: 'dropped', error: 'Destination is no longer listened to', nextAttemptAt: 0 }); return;
       }
       if (!source.enabled || !adapter.enabled) {
         await this.engine.store.put(tx, 'outbox', id, { ...current, status: 'pending', error: 'Source is disabled', nextAttemptAt: this.clock.now() + 2000 }); return;
+      }
+      if (!adapter.listened(current.destination)) {
+        await this.engine.store.put(tx, 'outbox', id, { ...current, status: 'dropped', error: 'Destination is no longer listened to', nextAttemptAt: 0 }); return;
       }
       if (current.nextAttemptAt > this.clock.now()) return;
       if (current.attempt >= 8) { await this.engine.store.put(tx, 'outbox', id, { ...current, status: 'attention', error: 'Outbound message exhausted 8 attempts', nextAttemptAt: 0 }); return; }
@@ -222,7 +225,10 @@ export class Outbox {
   async inspectReceipt(id: string): Promise<ReceiptLookup> {
     const message = await this.engine.store.read<OutboundMessage>('outbox', id);
     if (!message) throw new Error('Unknown outbound message');
-    if (message.status === 'sent' && message.receipt !== undefined) return { status: 'found', receipt: message.receipt };
+    if (message.status === 'sent' && message.receipt !== undefined) {
+      await this.reconcileReceiptCompletion(message);
+      return { status: 'found', receipt: message.receipt };
+    }
     const adapter = this.adapters.get(message.destination.sourceId);
     if (!adapter) return { status: 'unknown' };
     const result = await this.lookup(adapter, message.idempotencyKey);
@@ -231,8 +237,32 @@ export class Outbox {
       if (!current || current.payloadDigest !== message.payloadDigest || current.status === 'sent') return;
       await this.engine.store.put(tx, 'outbox', id, { ...current, status: 'sent', receipt: result.receipt, nextAttemptAt: 0 });
     });
+    if (result.status === 'found') await this.reconcileReceiptCompletion(message);
     return result;
   }
-  async completed(): Promise<void> { await this.arm(); }
+  private async reconcileReceiptCompletion(message: OutboundMessage): Promise<void> {
+    const current = await this.engine.transaction(async tx => {
+      const record = await this.engine.store.get<OutboundMessage>(tx, 'outbox', message.id);
+      const ticket = record && await this.engine.store.get<Ticket>(tx, 'ticket', record.ticketId);
+      if (!record || record.payloadDigest !== message.payloadDigest || record.status !== 'sent' || !ticket ||
+          ticket.lifecycle !== 'open' || ticket.mandateId !== record.mandateId || ticket.assignmentEpoch !== record.assignmentEpoch) return false;
+      if (ticket.attention === 'Outbound message outcome uncertain') {
+        const messages = await this.engine.store.listInTransaction<OutboundMessage>(tx, 'outbox');
+        const unresolved = messages.some(item => item.ticketId === ticket.id && item.assignmentEpoch === ticket.assignmentEpoch &&
+          ['uncertain', 'attention'].includes(item.status));
+        if (!unresolved) {
+          const next = { ...ticket };
+          delete next.attention;
+          await this.engine.store.put(tx, 'ticket', ticket.id, next);
+        }
+      }
+      return true;
+    });
+    if (current) await this.engine.transaction(tx => this.engine.lifecycle.completeInTransaction(tx, message.ticketId));
+  }
+  async completed(): Promise<void> {
+    if (!this.closed) await this.engine.transaction(tx => this.engine.lifecycle.completeInTransaction(tx));
+    await this.arm();
+  }
   close(): void { this.closed = true; if (this.timer) clearTimeout(this.timer); }
 }

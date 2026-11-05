@@ -1,3 +1,9 @@
+import { preflightRestore, finishRestore, type EnvironmentDependency } from './backup.js';
+import { LocalEnvironmentBroker } from '../environments/local.js';
+import { RemoteEnvironmentBroker } from '../environments/remote.js';
+import { resolve } from 'node:path';
+import { preflightDocuments, preflightTasks, compatibleMigration } from './migrations.js';
+import type { Extension } from '@earendil-works/pi-durable';
 import { Outbox, type OutboxOptions } from '../services/outbox.js';
 import type { EnvironmentOptions } from "../services/jobs.js";
 import { reconcile } from "./reconcile.js";
@@ -39,6 +45,10 @@ import {
 const openDirectories = new Set<string>();
 export interface OpenOptions {
   directory: string;
+  /** Host-installed durable tasks; never supplied by models or management callers. */
+  extensions?: readonly Extension[];
+  /** Explicitly permit pure registered upgrades, after preflighting all live checkpoints. */
+  allowTaskMigrations?: boolean;
   models?: Models;
   model?: ModelRef;
   instanceId?: string;
@@ -48,6 +58,8 @@ export interface OpenOptions {
   cancellationHandler?: CancellationHandler;
   environment?: EnvironmentOptions;
   outbox?: OutboxOptions;
+  /** Defer native effects until host listeners and credentials are ready. Call activate() explicitly. */
+  startPaused?: boolean;
   /** Additional recovery checks run while scheduling is paused. Throwing closes storage and releases the lock. */
   preflight?: (engine: Engine) => Promise<void>;
 }
@@ -58,6 +70,7 @@ export interface SuperAgentRuntime {
   readonly control: Conversation;
   readonly agents: AgentCoordinator | undefined;
   readonly artifactRoot: string;
+  activate(): Promise<void>;
   close(): Promise<void>;
   updatePolicy(policy: Policy, actor: Actor, meta: CommandMeta): Promise<void>;
   listCandidates(): Promise<Eval[]>;
@@ -139,7 +152,9 @@ export async function openSuperAgent(
         cause,
       });
     }
+    const restored = await preflightRestore(directory, options.environment);
     storage = await openNodeSqliteStorage(join(directory, "session.sqlite"));
+    await preflightDocuments(storage);
     const registry = createRegistry();
     harness = await Harness.open(
       storage,
@@ -211,6 +226,7 @@ export async function openSuperAgent(
         ],
       }),
     );
+    for (const extension of options.extensions ?? []) registry.install(extension);
     const snapshot = registry.snapshot();
     const definitions = {
       extensions: snapshot
@@ -239,7 +255,8 @@ export async function openSuperAgent(
         canonicalJson(previousDefinitions) !==
           canonicalJson(baselineDefinitions) &&
         canonicalJson(previousDefinitions) !== canonicalJson({ ...definitions, tasks: Object.fromEntries(Object.entries(definitions.tasks).filter(([name]) => name !== "sa.outbox")) }) &&
-        canonicalJson(previousDefinitions) !== canonicalJson({ ...definitions, tasks: Object.fromEntries(Object.entries(definitions.tasks).filter(([name]) => !["sa.job", "sa.outbox"].includes(name))) })
+        canonicalJson(previousDefinitions) !== canonicalJson({ ...definitions, tasks: Object.fromEntries(Object.entries(definitions.tasks).filter(([name]) => !["sa.job", "sa.outbox"].includes(name))) }) &&
+        !(options.allowTaskMigrations === true && compatibleMigration(previous, snapshot))
       ) {
         throw new Error(
           "Installed extension/task definitions do not match persisted metadata",
@@ -251,6 +268,7 @@ export async function openSuperAgent(
       )
         throw new Error("instanceId differs from persisted metadata");
     }
+    await preflightTasks(storage, snapshot, options.allowTaskMigrations === true);
     await engine.transaction(async (tx) => {
       if (!(await store.get<Source>(tx, "source", "cli")))
         await store.put(tx, "source", "cli", {
@@ -259,6 +277,20 @@ export async function openSuperAgent(
           enabled: true,
         });
     });
+    const broker=coordinator.jobs.broker;
+    if (broker instanceof LocalEnvironmentBroker) {
+      const previous = await store.read<EnvironmentDependency>('metadata', 'environment');
+      // Establish the empty inventory before publishing metadata. Once published,
+      // absence is lost history, never a reason to recreate a broker directory.
+      if (!previous && !(await store.list('job')).length) await mkdir(broker.directory, { recursive: true, mode: 0o700 });
+      if (await realpath(broker.directory) !== broker.directory) throw Error('Original endpoint dependency path changed');
+    }
+    const dependency:EnvironmentDependency|undefined=broker instanceof LocalEnvironmentBroker
+      ? {kind:'local',directory:broker.directory,repository:await realpath(broker.options.repository)}
+      : broker instanceof RemoteEnvironmentBroker
+        ? {kind:'remote',directory:resolve(broker.options.directory),endpointId:broker.options.endpointId}
+        : broker?{kind:'custom'}:undefined;
+    if(dependency)await engine.transaction(tx=>store.put(tx,'metadata','environment',dependency));
     await options.preflight?.(engine);
     await coordinator.initialize();
     await engine.transaction(async (tx) => {
@@ -277,7 +309,9 @@ export async function openSuperAgent(
         });
     });
     await reconcile(engine);
+    await engine.transaction(tx => engine.lifecycle.completeInTransaction(tx));
     await outbox.reconcile();
+    await coordinator.jobs.receipts.reconcile();
     // An explicit model activates execution. A model-free recovery keeps live
     // agent tasks durable and paused; domain receives/commands still commit.
     const recoveredAgentWork =
@@ -288,13 +322,21 @@ export async function openSuperAgent(
             task.record.kind !== "sa.intake" && task.record.kind !== "sa.outbox") ||
           task.record.kind === "pi.generation",
       );
-    if (!recoveredAgentWork) harness.resume();
     const agents = options.model ? coordinator : undefined;
-    await agents?.pump();
+    let activated = false;
+    let activation: Promise<void> | undefined;
+    const activate = () => activation ??= (async () => {
+      if (!recoveredAgentWork) harness!.resume();
+      activated = true;
+      await agents?.pump();
+    })();
+    if (restored) await finishRestore(directory);
+    if (!options.startPaused) await activate();
     const openedHarness = harness;
     let closing: Promise<void> | undefined;
     return {
       engine,
+      activate,
       outbox,
       harness,
       control,
@@ -302,12 +344,12 @@ export async function openSuperAgent(
       artifactRoot: artifacts.root,
       updatePolicy: async (policy, actor, meta) => {
         await engine.updatePolicy(policy, actor, meta);
-        agents?.kick();
+        if (activated) agents?.kick();
       },
       listCandidates: () => engine.listCandidates(),
       decide: async (evalId, epoch, outcome, meta) => {
         const result = await engine.decide(evalId, epoch, outcome, meta);
-        agents?.kick();
+        if (activated) agents?.kick();
         return result;
       },
       subscribe: (ticketId, sourceId, threadRef, own, meta) =>
@@ -318,11 +360,11 @@ export async function openSuperAgent(
         engine.handback(ticketId, triggerId, epoch, reason, meta),
       stopTicket: async (ticketId, actor, meta) => {
         await engine.stopTicket(ticketId, actor, meta);
-        agents?.kick();
+        if (activated) agents?.kick();
       },
       retryTicket: async (ticketId, actor, meta) => {
         await engine.retryTicket(ticketId, actor, meta);
-        agents?.kick();
+        if (activated) agents?.kick();
       },
       endTicket: (ticketId, epoch, meta) =>
         engine.endTicket(ticketId, epoch, meta),
@@ -330,6 +372,7 @@ export async function openSuperAgent(
         (closing ??= (async () => {
           try {
             outbox.close();
+            coordinator.jobs.receipts.close();
             await coordinator.close();
             await openedHarness.close(context);
           } finally {
@@ -338,12 +381,12 @@ export async function openSuperAgent(
         })()),
       receive: async (event) => {
         const result = await engine.receive(event);
-        agents?.kick();
+        if (activated) agents?.kick();
         return result;
       },
       receiveBatch: async (events, cursor) => {
         const result = await engine.receiveBatch(events, cursor);
-        agents?.kick();
+        if (activated) agents?.kick();
         return result;
       },
       readTicket: <T>(id: string) => store.read<T>("ticket", id),
