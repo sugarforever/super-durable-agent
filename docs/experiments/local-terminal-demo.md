@@ -1,10 +1,10 @@
 # Local terminal experiment: the interrupted CSV exporter
 
-This experiment uses internal Tickets and local files. GitHub, Feishu, and a public tunnel are unnecessary. It separates a repeatable controlled-provider starter from a real-model experiment: the starter verifies wiring; the real-model run also evaluates reasoning and tool use.
+This experiment uses internal Tickets and local files. GitHub, Feishu, and a public tunnel are unnecessary. Run the faux-provider starter to check runtime wiring. Use the separate CSV experiment to evaluate a real model’s reasoning and tool use.
 
-## Starter run and recording runbook
+## Quick start: no model key required
 
-Start in the repository root with a POSIX shell, Node 22.19+ and installed dependencies. Use a 120-column, 32-row terminal. The captured shell uses `demo[exit-status] > ` as its prompt. No model key is required. Run each command to completion before entering the next; each successful command returns to the shell prompt.
+Start in the repository root with a POSIX shell, Node 22.19+ and installed dependencies. Run each command to completion before entering the next.
 
 ```sh
 npm run build
@@ -14,22 +14,28 @@ node -e 'const fs=require("node:fs");const r=JSON.parse(fs.readFileSync(process.
 node dist/cli.js --directory "$DEMO_DIR" list ticket
 ```
 
-Expected result: native-faux provider, two Tickets, feedbackSameTicket true, and ready Reports. The demo starts real native Conversations/Tasks and SQLite, then closes. It does not execute the CSV experiment, use a paid model, or prove model quality. The final shell prompt and persisted Ticket inspection are the end of this recording. Keep DEMO_DIR to inspect the database later.
+Expected result: native-faux provider, two Tickets, feedbackSameTicket true, and ready Reports. The demo starts real native Conversations/Tasks and SQLite, then closes. It does not execute the CSV experiment, use a paid model, or prove model quality. Keep `DEMO_DIR` to inspect the database later.
 
-## Full real-model experiment
+## CSV experiment: real model required
 
 ### Prepare
 
 Use three terminals: service, operator, and monitor. Create a disposable committed Git repository with a tiny Node project and a test command. Keep primary state and broker state in persistent directories outside that repository. Configure the service using [Operations](../operations.md), with:
 
-- An installed OpenAI/Anthropic model and an environment-referenced API key.
-- Separate management operator and viewer credentials; a configured operator ID of `operator` for the example Policy below.
-- Local environment repository and broker directory; trustedLocalShell enabled only for the disposable execution environment.
+- An OpenAI or Anthropic model from the installed catalog, with its API key supplied through an environment variable.
+- Separate management operator and viewer credentials; the operator ID included in the Policy’s allowed actors.
+- Local environment repository and broker directory; `trustedLocalShell` enabled only for the disposable execution environment.
 - No GitHub or Feishu configuration.
 
 Start `node dist/cli.js --config service.json run` in terminal 1. Wait for the listening message before sending input. Model calls require internet access. Do not display credentials while recording, and keep shell tracing disabled.
 
-In terminal 2, set BASE to `http://127.0.0.1:8787`. Install a Policy granting the configured operator explicit `repo.read`, `repo.write`, and `command.execute` with acceptMode observe. Use authenticated POST /policy with a unique commandId and a monotonically increasing Policy version. Leave channel.reply out for this local experiment: inspect structured Reports in the terminal instead of creating outbound intent without a local sender adapter. See [the API](../api.md) for authority semantics.
+Use `http://127.0.0.1:8787` as the service URL in terminals 2 and 3. In terminal 2, send an authenticated `POST /policy` with:
+
+- A unique `commandId` and a Policy version greater than the current version.
+- `acceptMode: "observe"` and the configured operator in `allowedActors`.
+- Explicit capabilities `repo.read`, `repo.write`, and `command.execute`.
+
+Omit `channel.reply`: this experiment inspects Reports through the API and has no local sender adapter. See [the API](../api.md) for the Policy fields and authorization rules.
 
 Submit requests to authenticated POST /receive. Each JSON event needs sourceId `cli`, a unique externalId, revision `1`, threads, body, receivedAt/occurredAt in epoch milliseconds, and addressed true. The API supplies the authenticated Actor; do not put credentials in the event. Use the same Thread string for follow-up and a different one for independent work.
 
@@ -41,7 +47,7 @@ Send this request on Thread `local:csv`:
 
 Wait until /tickets shows an accepted Ticket. The model may ask a clarification; answer on the same Thread before continuing. Record its Ticket ID.
 
-### Act 2: Steer and introduce independent work
+### Act 2: Send feedback and start independent work
 
 While the exporter is working, send another event on `local:csv`:
 
@@ -59,13 +65,13 @@ On `local:csv`, request:
 
 > Start one background Job that appends started to e2e-progress.txt, waits 90 seconds, then appends finished. Return the Job ID immediately and await its result. Never launch a replacement if the outcome is uncertain.
 
-Wait for /taskGraph to show the Job and confirm the started file in that Ticket's worktree. Record the Job ID and file contents. Terminate the primary controller with SIGKILL using its verified PID, then restart the exact same configuration and directories.
+Wait for `/taskGraph` to show the Job and confirm the `started` line in `e2e-progress.txt` in that Ticket's worktree. Record the Job ID and file contents. Terminate the primary controller with SIGKILL using its verified PID, then restart the exact same configuration and directories.
 
-Local subprocess recovery may conservatively become unknown after losing process supervision. That is a valid safety result, not a failed demo: the operation must not be blindly relaunched, and its reservation/attention must remain visible. Do not erase the broker ledger to make it run. To demonstrate reliable late-completion lookup across controller death, run the optional remote daemon separately and leave it alive; query-only reconciliation then observes its authoritative completion receipt without another command execution.
+Local subprocess recovery may conservatively become unknown after losing process supervision. In that state, the operation must not be relaunched automatically, and its capacity reservation and attention warning must remain visible. Do not erase the broker ledger to make it run. To demonstrate reliable late-completion lookup across controller death, run the optional remote daemon separately and leave it alive; query-only reconciliation then observes its authoritative completion receipt without another command execution.
 
 ### Act 4: Explicit stop
 
-Start a second long Job after resolving the prior outcome. Before it finishes, POST /tickets/URL_ENCODED_TICKET_ID/stop with an operator credential and a new commandId. Observe stopped lifecycle and cancelled or explicitly unknown execution accounting. Restarting must not resume the stopped Ticket. An already written started line is not rolled back. POST /retry is a separate authorized action creating a fresh Assignment/epoch.
+Start a second long Job after resolving the prior outcome. Before it finishes, POST /tickets/URL_ENCODED_TICKET_ID/stop with an operator credential and a new commandId. Observe stopped lifecycle and cancelled or explicitly unknown execution accounting. Restarting must not resume the stopped Ticket. An already written started line is not rolled back. `POST /tickets/URL_ENCODED_TICKET_ID/retry` is a separate authorized action that creates a new Assignment and epoch.
 
 ### Monitor and evaluate
 
@@ -80,6 +86,14 @@ In terminal 3, repeatedly GET these endpoints with the viewer credential. Use a 
 | Broker worktree files and git diff | Actual code, filename, tests, and side effects |
 | Separate optional Watchdog stdout | Meaningful diagnostics; quiet unchanged observations |
 
-There is no management token-stream or full-transcript view. Local ready Reports may leave Tickets open awaiting further input or explicit lifecycle handling; ready does not mean automatically accepted/ended. A legitimate waiting or unknown state must be explained, not edited away for the recording.
+There is no management token-stream or full-transcript view. Local ready Reports may leave Tickets open awaiting further input or explicit lifecycle handling; ready does not mean automatically accepted/ended. Record waiting and unknown states as observed.
 
-Success means two independent Tickets, same-Ticket steering, correct files/tests, nonblocking Job admission, persisted state after restart, no blind repeat of an uncertain command, preserved worktree changes, and a stop that prevents automatic resumption. Record observed deviations separately as model-quality, routing, execution, or recovery issues. For video, capture actual terminal bytes/timing and retain the raw recording; any later edited replay must preserve their causal order and disclose controlled-provider use.
+Check these results:
+
+- Two independent Tickets exist; exporter feedback reaches the original Ticket.
+- The exporter uses `report.csv` and passes the requested tests.
+- Starting a Job returns its ID before the command finishes.
+- State and worktree changes survive restart. Uncertain commands are not repeated automatically.
+- Stopping a Ticket prevents automatic resumption.
+
+Record deviations as model-quality, routing, execution, or recovery issues. If recording a video, retain the raw terminal recording. Edited footage must preserve event order and disclose faux-provider use.

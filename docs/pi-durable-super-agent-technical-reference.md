@@ -1,21 +1,21 @@
 # pi-durable Super Agent: Technical Reference
 
-Reference date: 2026-11-02. Runtime baseline: pi-durable, pi-ai, and chord 1.1.0.
+Runtime baseline: pi-durable, pi-ai, and chord 1.1.0.
 
-This document describes the implemented Super Agent architecture, workflows, and features. It consolidates the technical model for engineers extending or operating the system. The original DeepSeek Super-agent organization supplies the Router/Worker and event-ownership concepts; this project implements them through pi's persistence and execution mechanisms. A DeepSeek model is not required. The current CLI supports OpenAI and Anthropic provider integrations.
+This reference explains how the system works and where its guarantees end. It uses the Router/Worker model from the DeepSeek Super-agent design, implemented with pi persistence and execution. The CLI supports OpenAI and Anthropic models; a DeepSeek model is not required.
 
-For configuration and commands, use [Operations and recovery](operations.md). For exact host interfaces, use [Runtime API](api.md). The [architecture baseline](architecture.md), [source evidence](research/evidence.md), and [implementation checkpoints](checkpoints.md) provide design lineage and validation history.
+For configuration and commands, use [Operations and recovery](operations.md). For exact host interfaces, use [Runtime API](api.md). The [architecture baseline](architecture.md), [source evidence](research/evidence.md), and [implementation checkpoints](checkpoints.md) record the design and validation history.
 
 ## 1. System model
 
-A Super Agent manages persistent work rather than treating each message as an isolated model request. A long-lived Router evaluates new work. A separate Worker handles each accepted Ticket, retaining context as feedback, tool results, and external events arrive. The Engine owns authorization and state transitions. Models propose actions through constrained tools.
+A Super Agent keeps work and context across messages and restarts. A long-lived Router evaluates new work. A separate Worker handles each accepted Ticket, retaining context as feedback, tool results, and external events arrive. The Engine owns authorization and state transitions. Models propose actions through constrained tools.
 
 The design supports four properties:
 
 - **Continuity:** related events return to the responsible Worker and retained coding workspace.
 - **Concurrency:** independent Workers and asynchronous Jobs can progress together within explicit capacity limits.
 - **Proactivity:** enabled Policy rules can authorize inferred work; source content alone cannot grant permission.
-- **Persistence:** committed state and execution intent survive process interruption, with uncertain external effects represented explicitly.
+- **Persistence:** committed state and execution intent survive process interruption, and records external operations whose outcome is unknown.
 
 ### Components and trust boundaries
 
@@ -38,9 +38,9 @@ flowchart TB
   Watchdog[Separate Watchdog process and ledger] -->|Authenticated management API| Engine
 ```
 
-One active primary process controls one Harness Session and SQLite database for a project/trust boundary. An OS-held advisory lock prevents a second cooperating primary writer. The endpoint and Watchdog retain separate ledgers because their facts must outlive primary-process interruption.
+One primary process controls one Harness Session and SQLite database. An OS-held advisory lock prevents a second cooperating primary writer. Execution endpoints and the Watchdog keep separate ledgers so their records survive a primary-process crash.
 
-## 2. Mapping the organization to pi
+## 2. Mapping to pi
 
 | Application concept | pi mechanism | Application responsibility |
 | --- | --- | --- |
@@ -53,9 +53,9 @@ One active primary process controls one Harness Session and SQLite database for 
 | Model integration | pi-ai Models and configured provider/model | Resolve credentials outside prompts and select supported models |
 | Recovery | Native Task checkpoints and persisted inbox/generation state | Reconcile domain intent with native and external receipts |
 
-The Harness commit is the authoritative atomic boundary. Network requests, model calls, Git/filesystem operations, and subprocess execution happen outside it. External work is represented by durable intent and receipts; it is not made atomic with SQLite.
+A Harness commit saves domain state and native execution intent atomically. Network requests, model calls, Git/filesystem operations, and subprocess execution happen outside it. External work is represented by durable intent and receipts; it is not made atomic with SQLite.
 
-Workers are ownerless Conversations. A task-owned child Conversation would inherit its owner's cancellation/failure, which is unsuitable for work that must survive Router completion or abort. Control owns background coordination Tasks, and Engine commands explicitly cancel the relevant Worker and work when required. An idle Ticket does not need a permanently running anchor Task.
+Workers are Conversations without a parent Task. A task-owned child Conversation would inherit its owner's cancellation/failure, which is unsuitable for work that must survive Router completion or abort. Control owns background coordination Tasks, and Engine commands explicitly cancel the relevant Worker and work when required. An idle Ticket needs no running Task.
 
 ## 3. Identity and state
 
@@ -72,11 +72,11 @@ Workers are ownerless Conversations. A task-owned child Conversation would inher
 | Job | Asynchronous operation with stable external identity and accounting state |
 | Outbox message | Authorized external communication intent, retry state, and receipt |
 
-Ticket, Assignment, Conversation, and native Task IDs are distinct. Retrying a Ticket creates a new Assignment/epoch while preserving the Ticket and Worker context. Reusing a native Task identity is not the mechanism for resuming a user goal.
+Ticket, Assignment, Conversation, and native Task IDs are distinct. Retrying a Ticket creates a new Assignment/epoch while preserving the Ticket and Worker context. Resuming work does not require reusing a native Task ID.
 
-Stable command, submission, Job, and Outbox keys bind to canonical payload digests. An identical replay returns or reconciles the existing outcome; the same key with different meaningful content is rejected. pi's requestId deduplication alone does not compare payload equality, so the application performs that check.
+Each command, submission, Job, and Outbox key is bound to a hash of its normalized payload. An identical replay returns or reconciles the existing outcome; the same key with different meaningful content is rejected. pi's requestId deduplication alone does not compare payload equality, so the application performs that check.
 
-Mutable domain records carry revisions. Large bodies and frozen prompts spill to SHA-256-addressed artifacts above 16 KiB UTF-8. Authorized paginated recall resolves those references; knowing a digest alone does not grant access.
+Mutable domain records carry revisions. Bodies and frozen prompts larger than 16 KiB of UTF-8 are stored as artifacts identified by SHA-256 hashes. Recall checks authorization and returns paginated content; a hash alone does not grant access.
 
 ## 4. Workflows
 
@@ -131,11 +131,11 @@ If a remote operation outlives a transport deadline, the primary retains running
 
 - Each Task performs at most one receipt lookup and cannot prepare, execute, or cancel work.
 - Persisted retry delays increase from 2 seconds to a 60-second cap.
-- At most one live query claim per Job and eight per runtime bound lookup concurrency.
+- At most one receipt lookup per Job and eight per runtime can be active at once.
 - Startup resumes unfinished claims and schedules due checks; in-memory timers only wake reconciliation.
 - Absence, timeout, or lookup failure never authorizes command replay.
 
-A terminal receipt updates accounting and sends the current authorized Worker a distinct, deduplicated result even if an earlier uncertainty notification was consumed. A matching Job-only uncertainty diagnostic can clear; unrelated attention remains. Stopped or old-epoch receipts are accounting-only.
+A terminal receipt updates accounting and sends the current authorized Worker a distinct, deduplicated result even if an earlier uncertainty notification was consumed. A receipt can clear the uncertainty warning for that Job. Other warnings remain. Receipts for stopped or older Assignments update accounting only.
 
 ### 4.4 Reports, external replies, and completion
 
@@ -156,11 +156,11 @@ Ticket lifecycle is open, ended, or stopped. Ready alone does not end a Ticket. 
 
 Per-Job cancellation is operation-specific. Remote cancellation binds the exact original operation and can leave a durable tombstone before delayed execution arrives. Ticket-wide revocation uses a separate trusted epoch-revocation grant; cancelling one Job does not disable unrelated same-epoch operations.
 
-Explicit Ticket retry revalidates authority and creates a fresh Assignment/epoch. Confirmed old cancellation gates reuse. Cancellation does not undo already completed external effects.
+Explicit Ticket retry revalidates authority and creates a fresh Assignment/epoch. The previous cancellation must be confirmed before the Worker can be reused. Cancellation does not undo already completed external effects.
 
 ### 4.6 Restart and recovery
 
-Startup acquires the primary lock, validates restore dependencies and supported Document/Task definitions, constructs the runtime paused, and reconciles persisted work before activation. Hosts using startPaused configure listeners and trusted bindings before calling activate. Model-free reopening preserves agent-work inspection restrictions.
+Startup acquires the primary lock, validates restore dependencies and supported Document/Task definitions, constructs the runtime paused, and reconciles persisted work before activation. Hosts using `startPaused` configure listeners and trusted bindings before calling `activate`. Model-free reopening preserves agent-work inspection restrictions.
 
 | Interrupted boundary | Recovery behavior |
 | --- | --- |
@@ -186,17 +186,17 @@ Trusted shell is disabled by default and requires both configuration opt-in and 
 
 ### Capacity
 
-The default scheduler provides three ordinary reservations plus one reserved for human feedback waking an existing Worker. Preparation, active generation, and pending/running/unknown Jobs count. Feedback to an already active Worker shares its reservation. Human priority includes an ordinary-work fairness bound. Startup reconstructs capacity from persisted domain and native facts; restarting does not erase unknown work.
+The default scheduler provides three ordinary reservations plus one reserved for human feedback waking an existing Worker. Preparation, active generation, and pending/running/unknown Jobs count. Feedback to an already active Worker shares its reservation. When an ordinary slot is available, ordinary work is admitted after three human-priority bypasses. Startup reconstructs capacity from persisted domain and native facts; restarting does not erase unknown work.
 
 ### Independent Watchdog
 
-The Watchdog runs in a separate process with its own locked ledger. It reads authenticated management projections and never opens primary SQLite. Default observation interval is 60 seconds; the no-progress candidate threshold is 15 minutes.
+The Watchdog runs in a separate process with its own locked ledger. It reads the authenticated management API and never opens the primary SQLite database. Default observation interval is 60 seconds; the no-progress candidate threshold is 15 minutes.
 
 Waiting for people, endpoint/input waits, ready work awaiting review, offline endpoints, and active/unknown Jobs are distinguished from unexplained lack of progress. Missing metrics remain unknown. An optional diagnostic model has no tools and uses a persistently reserved call/token/cost budget; the default semantic budget is zero.
 
-Actions are limited to status requests, reconciliation of existing safe outbound intent, optionally authorized pause, and notification. The Watchdog cannot change Policy, inject work, retry a Ticket, or mint a Mandate. Notification/action deduplication survives restart. The shipped notification output is structured local stdout; claimed/unknown action outcomes are not blindly replayed after a crash.
+Actions are limited to status requests, reconciliation of existing safe outbound intent, optionally authorized pause, and notification. The Watchdog cannot change Policy, inject work, retry a Ticket, or mint a Mandate. Notification/action deduplication survives restart. Notifications are written as structured data to local stdout; claimed/unknown action outcomes are not blindly replayed after a crash.
 
-## 6. Implemented feature surface
+## 6. Features and limits
 
 | Area | Implemented behavior | Boundary |
 | --- | --- | --- |
@@ -242,6 +242,6 @@ This is a single-host primary design using a local filesystem and POSIX advisory
 | Management and supervision | [API](../src/api/server.ts), [Watchdog](../src/watchdog/core.ts), [runner](../src/watchdog/runner.ts) | integration and Watchdog tests |
 | Backup and restore | [Backup](../src/runtime/backup.ts) | recovery and artifact tests |
 
-The reviewed runtime baseline passed 276 tests across 15 files, seven native pi contract probes, typecheck/build, and CI on Node 22.19 and 24. Controlled acceptance covers real SQLite, Git worktrees, subprocesses, authenticated loopback services, signed source fixtures, and native Router/two-Worker execution through a faux provider.
+The [November 5 validation record](checkpoints.md#final-verification-and-acceptance-reconciliation-november-5-2026) reports 295 passing tests across 16 files, seven native pi contract probes, typecheck/build, and CI on Node 22.19 and 24. These are recorded results, not checks rerun for this document. Controlled acceptance covers real SQLite, Git worktrees, subprocesses, authenticated loopback services, signed source fixtures, and native Router/two-Worker execution through a faux provider.
 
 The combined workflow exercises follow-up input, long and queued Job cancellation, restart, Reports/Outbox, PR closure, and coding continuity across resumption/retry. Additional tests cover automatic late receipts on both remote transports and missing frozen-prompt backup rejection. These tests establish controlled execution behavior, not real-provider reasoning quality, live account/device/TLS behavior, or production throughput. Use the [checkpoints](checkpoints.md) for the recorded evidence and the [operations guide](operations.md) to prepare live validation.
