@@ -4,6 +4,8 @@ A pi-durable implementation of the DeepSeek Super-agent organization: a long-liv
 
 Development is organized as ten stacked pull requests, each linked to one requirement issue and an executable approval checkpoint. See [implementation status and checkpoints](docs/checkpoints.md) before relying on a capability.
 
+- [Technical reference](docs/pi-durable-super-agent-technical-reference.md): implemented architecture, pi mapping, workflows, features, and operational boundaries.
+- [Local terminal experiment](docs/experiments/local-terminal-demo.md): a credential-free starter and a real-model CSV workflow with steering, concurrent work, and interruption recovery.
 - [Architecture](docs/architecture.md): boundaries, state, event flow, authority, pi integration, and recovery.
 - [Service and GitHub setup](docs/integrations.md): CLI, credentials, roles, webhooks and PR lifecycle.
 - [Remote execution and Feishu](docs/remote-and-feishu.md): daemon transports, endpoint continuity and verified messaging.
